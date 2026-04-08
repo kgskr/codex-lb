@@ -473,7 +473,14 @@ class LoadBalancer:
         allowed_ids = None if routing_subject_ids is None else set(routing_subject_ids)
         excluded_ids = set(exclude_routing_subject_ids or ())
         async with self._repo_factory() as repos:
-            identities = await repos.platform_identities.list_eligible_identities(route_family)
+            platform_identities = repos.platform_identities
+            if platform_identities is None:
+                return RoutingSubjectSelection(
+                    target=None,
+                    error_message="OpenAI Platform identities repository is unavailable",
+                    error_code="no_provider_subjects",
+                )
+            identities = await platform_identities.list_eligible_identities(route_family)
             if allowed_ids is not None:
                 identities = [identity for identity in identities if identity.id in allowed_ids]
             if excluded_ids:
@@ -563,9 +570,7 @@ class LoadBalancer:
         secondary_threshold = float(getattr(settings, "drain_secondary_threshold_pct", 90.0))
 
         considered_states = [
-            state
-            for state in states
-            if state.status not in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED)
+            state for state in states if state.status not in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED)
         ]
         if not considered_states:
             return False

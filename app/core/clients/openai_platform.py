@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
+from typing import Protocol, cast
 
 import aiohttp
 
@@ -11,6 +11,7 @@ from app.core.errors import openai_error
 from app.core.openai.models import OpenAIResponsePayload
 from app.core.openai.parsing import parse_error_payload, parse_response_payload
 from app.core.types import JsonValue
+from app.core.utils.json_guards import is_json_dict
 from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import format_sse_event
 
@@ -41,6 +42,14 @@ class OpenAIPlatformError(Exception):
         super().__init__(f"OpenAI Platform request failed with status {status_code}")
         self.status_code = status_code
         self.payload = payload
+
+
+class _ChunkedContent(Protocol):
+    def iter_chunked(self, size: int) -> AsyncIterator[bytes]: ...
+
+
+class _ChunkedResponse(Protocol):
+    content: _ChunkedContent
 
 
 def build_platform_headers(
@@ -92,10 +101,10 @@ async def fetch_models(
     timeout = aiohttp.ClientTimeout(total=_MODELS_TIMEOUT_SECONDS)
     session = get_http_client().session
     async with session.get(url, headers=headers, timeout=timeout) as response:
-        payload = await response.json(content_type=None)
+        payload = await _read_response_body(response)
         if response.status >= 400:
             raise OpenAIPlatformError(response.status, _normalize_error_payload(payload, response.status))
-        if not isinstance(payload, dict):
+        if not is_json_dict(payload):
             raise OpenAIPlatformError(502, _server_error("invalid_platform_models_response"))
         return PlatformModelsResponse(
             payload=payload,
@@ -116,12 +125,12 @@ async def create_response(
     timeout = aiohttp.ClientTimeout(total=_RESPONSES_TIMEOUT_SECONDS)
     session = get_http_client().session
     async with session.post(url, headers=headers, json=dict(payload), timeout=timeout) as response:
-        body = await response.json(content_type=None)
+        body = await _read_response_body(response)
         if response.status >= 400:
             raise OpenAIPlatformError(response.status, _normalize_error_payload(body, response.status))
         parsed = parse_response_payload(body)
         if parsed is None:
-            if isinstance(body, dict):
+            if is_json_dict(body):
                 return PlatformResponseResult(payload=body, upstream_request_id=response.headers.get("x-request-id"))
             raise OpenAIPlatformError(502, _server_error("invalid_platform_response"))
         return PlatformResponseResult(payload=parsed, upstream_request_id=response.headers.get("x-request-id"))
@@ -147,7 +156,7 @@ async def stream_responses(
     response = await session.post(url, headers=headers, json=dict(payload), timeout=timeout)
     if response.status >= 400:
         try:
-            body = await response.json(content_type=None)
+            body = await _read_response_body(response)
         finally:
             response.release()
         raise OpenAIPlatformError(response.status, _normalize_error_payload(body, response.status))
@@ -159,7 +168,7 @@ async def stream_responses(
 
 async def _stream_response_events(response: aiohttp.ClientResponse) -> AsyncIterator[str]:
     try:
-        async for event_block in _iter_sse_event_blocks(response):
+        async for event_block in _iter_sse_event_blocks(cast(_ChunkedResponse, response)):
             yield event_block
     finally:
         response.release()
@@ -167,22 +176,35 @@ async def _stream_response_events(response: aiohttp.ClientResponse) -> AsyncIter
 
 def failed_event_payload(status_code: int, payload: dict[str, JsonValue]) -> str:
     error_payload = _normalize_error_payload(payload, status_code)
-    body = json.dumps(error_payload, separators=(",", ":"))
-    return format_sse_event(body)
+    return format_sse_event(error_payload)
 
 
-def _normalize_error_payload(payload: object, status_code: int) -> dict[str, JsonValue]:
-    if isinstance(payload, dict):
+def _normalize_error_payload(payload: JsonValue | None, status_code: int) -> dict[str, JsonValue]:
+    if is_json_dict(payload):
         parsed_error = parse_error_payload(payload)
         if parsed_error is not None:
             return payload
-    if isinstance(payload, dict):
+    if is_json_dict(payload):
         return payload
+    if isinstance(payload, str):
+        message = payload.strip()
+        if message:
+            return cast("dict[str, JsonValue]", openai_error(f"platform_http_{status_code}", message))
     return _server_error(f"platform_http_{status_code}")
 
 
 def _server_error(code: str) -> dict[str, JsonValue]:
-    return openai_error(code, "OpenAI Platform upstream error")
+    return cast("dict[str, JsonValue]", openai_error(code, "OpenAI Platform upstream error"))
+
+
+async def _read_response_body(response: aiohttp.ClientResponse) -> JsonValue | None:
+    try:
+        return cast(JsonValue, await response.json(content_type=None))
+    except (ValueError, UnicodeDecodeError):
+        body = await response.read()
+        if not body:
+            return None
+        return body.decode("utf-8", errors="replace")
 
 
 def _find_sse_separator(buffer: bytes | bytearray) -> tuple[int, int] | None:
@@ -205,7 +227,7 @@ def _pop_sse_event(buffer: bytearray) -> bytes | None:
     return event
 
 
-async def _iter_sse_event_blocks(response: aiohttp.ClientResponse) -> AsyncIterator[str]:
+async def _iter_sse_event_blocks(response: _ChunkedResponse) -> AsyncIterator[str]:
     buffer = bytearray()
     async for chunk in response.content.iter_chunked(4096):
         if not chunk:

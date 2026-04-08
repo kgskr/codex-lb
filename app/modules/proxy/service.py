@@ -491,7 +491,10 @@ class ProxyService:
         if selection.routing_subject_id is None:
             return None
         async with self._repo_factory() as repos:
-            identity = await repos.platform_identities.get_by_id(selection.routing_subject_id)
+            platform_identities = repos.platform_identities
+            if platform_identities is None:
+                return None
+            identity = await platform_identities.get_by_id(selection.routing_subject_id)
             if identity is None:
                 return None
             return _SelectedPlatformIdentity(
@@ -513,7 +516,7 @@ class ProxyService:
             return None
         adapter = cast(OpenAIPlatformProviderAdapter, self._provider_adapter(OPENAI_PLATFORM_PROVIDER_KIND))
         subject = self._platform_provider_subject(identity)
-        request_id = get_request_id()
+        request_id = ensure_request_id()
         start = time.monotonic()
         try:
             result = await adapter.fetch_models(subject)
@@ -638,7 +641,10 @@ class ProxyService:
             return
         reason = _platform_error_message(exc.payload) or _platform_error_code(exc.payload) or f"http_{exc.status_code}"
         async with self._repo_factory() as repos:
-            await repos.platform_identities.update_validation_state(
+            platform_identities = repos.platform_identities
+            if platform_identities is None:
+                return
+            await platform_identities.update_validation_state(
                 identity_id,
                 last_validated_at=None,
                 last_auth_failure_reason=reason,
@@ -5629,7 +5635,7 @@ def ensure_downstream_turn_state(headers: Mapping[str, str]) -> str:
 
 def _platform_error_code(payload: Mapping[str, JsonValue]) -> str | None:
     error = payload.get("error")
-    if not isinstance(error, Mapping):
+    if not is_json_mapping(error):
         return None
     code = error.get("code")
     return code if isinstance(code, str) else None
@@ -5637,7 +5643,7 @@ def _platform_error_code(payload: Mapping[str, JsonValue]) -> str | None:
 
 def _platform_error_message(payload: Mapping[str, JsonValue]) -> str | None:
     error = payload.get("error")
-    if not isinstance(error, Mapping):
+    if not is_json_mapping(error):
         return None
     message = error.get("message")
     return message if isinstance(message, str) else None

@@ -39,6 +39,9 @@ from app.modules.upstream_identities.repository import (
     OpenAIPlatformIdentityConflictError as UpstreamIdentityConflictError,
 )
 from app.modules.upstream_identities.schemas import (
+    PlatformIdentityCreateRequest as UpstreamPlatformIdentityCreateRequest,
+)
+from app.modules.upstream_identities.schemas import (
     PlatformIdentitySummary,
     PlatformIdentityValidationResult,
 )
@@ -250,8 +253,9 @@ class AccountsService:
         if await self._has_platform_identity():
             raise PlatformIdentityConflictError("Only one OpenAI Platform fallback key can be registered.")
         validation = await self._validate_platform_identity(payload)
+        upstream_payload = UpstreamPlatformIdentityCreateRequest.model_validate(payload.model_dump())
         try:
-            result = await self._platform_service.create_identity(payload, validation=validation)
+            result = await self._platform_service.create_identity(upstream_payload, validation=validation)
         except (IntegrityError, UpstreamIdentityConflictError) as exc:
             raise PlatformIdentityConflictError(str(exc)) from exc
         get_account_selection_cache().invalidate()
@@ -273,9 +277,7 @@ class AccountsService:
         if identity is None:
             raise PlatformIdentityNotFoundError(f"Platform identity not found: {account_id}")
 
-        upstream_payload = UpstreamPlatformIdentityUpdateRequest.model_validate(
-            payload.model_dump(exclude_unset=True)
-        )
+        upstream_payload = UpstreamPlatformIdentityUpdateRequest.model_validate(payload.model_dump(exclude_unset=True))
         validation = None
         if _should_revalidate_platform_identity(upstream_payload):
             api_key = (
@@ -289,9 +291,7 @@ class AccountsService:
                 else identity.organization_id
             )
             project = (
-                upstream_payload.project
-                if "project" in upstream_payload.model_fields_set
-                else identity.project_id
+                upstream_payload.project if "project" in upstream_payload.model_fields_set else identity.project_id
             )
             validation = await self._validate_platform_identity_fields(
                 api_key=api_key,

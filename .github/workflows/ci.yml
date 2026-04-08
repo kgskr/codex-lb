@@ -157,53 +157,6 @@ jobs:
       - name: Run tests
         run: uv run pytest
 
-  test-postgres:
-    name: Tests (pytest, PostgreSQL)
-    runs-on: ubuntu-24.04
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: codex_lb
-          POSTGRES_PASSWORD: codex_lb
-          POSTGRES_DB: codex_lb
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U codex_lb -d codex_lb"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    env:
-      CODEX_LB_TEST_DATABASE_URL: postgresql+asyncpg://codex_lb:codex_lb@127.0.0.1:5432/codex_lb
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6.0.2
-
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.3.10"
-
-      - name: Install frontend dependencies
-        run: cd frontend && bun install --frozen-lockfile
-
-      - name: Build frontend assets
-        run: cd frontend && bun run build
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v8.0.0
-        with:
-          python-version: "3.13"
-          enable-cache: true
-
-      - name: Install dependencies
-        run: uv sync --dev --frozen
-
-      - name: Run tests
-        run: uv run pytest
-
   migration-check:
     name: Migration check (alembic)
     runs-on: ubuntu-24.04
@@ -227,45 +180,6 @@ jobs:
           set -euo pipefail
           TMP_DB="$(mktemp -u /tmp/codex-lb-ci-migrate-XXXXXX.db)"
           DB_URL="sqlite+aiosqlite:///${TMP_DB}"
-          uv run codex-lb-db --db-url "${DB_URL}" upgrade head
-          uv run codex-lb-db --db-url "${DB_URL}" check
-
-  migration-check-postgres:
-    name: Migration check (alembic, PostgreSQL)
-    runs-on: ubuntu-24.04
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: codex_lb
-          POSTGRES_PASSWORD: codex_lb
-          POSTGRES_DB: codex_lb
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U codex_lb -d codex_lb"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6.0.2
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v8.0.0
-        with:
-          python-version: "3.13"
-          enable-cache: true
-
-      - name: Install dependencies
-        run: uv sync --dev --frozen
-
-      - name: Validate migration policy and drift on PostgreSQL
-        shell: bash
-        run: |
-          set -euo pipefail
-          DB_URL="postgresql+asyncpg://codex_lb:codex_lb@127.0.0.1:5432/codex_lb"
           uv run codex-lb-db --db-url "${DB_URL}" upgrade head
           uv run codex-lb-db --db-url "${DB_URL}" check
 

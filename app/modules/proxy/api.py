@@ -47,7 +47,7 @@ from app.core.runtime_logging import log_error_response
 from app.core.types import JsonValue
 from app.core.usage.types import UsageWindowRow
 from app.core.utils.json_guards import is_json_mapping
-from app.core.utils.request_id import get_request_id
+from app.core.utils.request_id import ensure_request_id, get_request_id
 from app.core.utils.sse import parse_sse_data_json
 from app.db.models import Account, AccountStatus, UsageHistory
 from app.db.session import get_background_session
@@ -149,11 +149,12 @@ async def responses(
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> Response:
+    effective_model = _effective_model_for_api_key(api_key, payload.model)
     provider_rejection = await _backend_codex_route_rejection(
         request=request,
         context=context,
         api_key=api_key,
-        model=payload.model,
+        model=effective_model,
     )
     if provider_rejection is not None:
         return provider_rejection
@@ -308,7 +309,7 @@ async def models(
         )
         await context.service.write_provider_rejection_log(
             api_key=api_key,
-            request_id=get_request_id(),
+            request_id=ensure_request_id(),
             model=None,
             error_code="provider_feature_unsupported",
             error_message=error["error"]["message"],
@@ -767,7 +768,7 @@ async def v1_chat_completions(
         )
         await context.service.write_provider_rejection_log(
             api_key=api_key,
-            request_id=get_request_id(),
+            request_id=ensure_request_id(),
             model=effective_model,
             error_code="provider_feature_unsupported",
             error_message=error["error"]["message"],
@@ -997,11 +998,12 @@ async def responses_compact(
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> JSONResponse:
+    effective_model = _effective_model_for_api_key(api_key, payload.model)
     provider_rejection = await _backend_codex_route_rejection(
         request=request,
         context=context,
         api_key=api_key,
-        model=payload.model,
+        model=effective_model,
     )
     if provider_rejection is not None:
         return cast(JSONResponse, provider_rejection)
@@ -1031,11 +1033,12 @@ async def v1_responses_compact(
     except ValidationError as exc:
         error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error)
+    effective_model = _effective_model_for_api_key(api_key, compact_payload.model)
     if await _should_reject_platform_only_public_route(
         context=context,
         api_key=api_key,
         route_family=PUBLIC_RESPONSES_HTTP_ROUTE_FAMILY,
-        model=compact_payload.model,
+        model=effective_model,
     ):
         error = _provider_error(
             "provider_feature_unsupported",
@@ -1043,8 +1046,8 @@ async def v1_responses_compact(
         )
         await context.service.write_provider_rejection_log(
             api_key=api_key,
-            request_id=get_request_id(),
-            model=compact_payload.model,
+            request_id=ensure_request_id(),
+            model=effective_model,
             error_code="provider_feature_unsupported",
             error_message=error["error"]["message"],
             route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
@@ -1219,7 +1222,7 @@ async def _maybe_build_platform_models_response(
         )
         await context.service.write_provider_rejection_log(
             api_key=api_key,
-            request_id=get_request_id(),
+            request_id=ensure_request_id(),
             model=None,
             error_code=selection.failure.error_code,
             error_message=error["error"]["message"],
@@ -1260,12 +1263,13 @@ async def _maybe_handle_platform_v1_responses(
     context: ProxyContext,
     api_key: ApiKeyData | None,
 ) -> Response | None:
+    effective_model = _effective_model_for_api_key(api_key, payload.model)
     selection = await context.service.select_routing_subject(
         capabilities=_derive_request_capabilities(
             route_family=PUBLIC_RESPONSES_HTTP_ROUTE_FAMILY,
             route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
             transport="http",
-            model=payload.model,
+            model=effective_model,
             payload=payload,
             headers=request.headers,
         ),
@@ -1279,8 +1283,8 @@ async def _maybe_handle_platform_v1_responses(
         )
         await context.service.write_provider_rejection_log(
             api_key=api_key,
-            request_id=get_request_id(),
-            model=payload.model,
+            request_id=ensure_request_id(),
+            model=effective_model,
             error_code=selection.failure.error_code,
             error_message=error["error"]["message"],
             route_class=selection.failure.route_class,
@@ -1305,7 +1309,7 @@ async def _maybe_handle_platform_v1_responses(
         request_service_tier=payload.service_tier,
     )
     rate_limit_headers = await context.service.rate_limit_headers()
-    request_id = get_request_id()
+    request_id = ensure_request_id()
     start = time.monotonic()
     if payload.stream:
         try:
@@ -1543,7 +1547,7 @@ async def _backend_codex_route_rejection(
     )
     await context.service.write_provider_rejection_log(
         api_key=api_key,
-        request_id=get_request_id(),
+        request_id=ensure_request_id(),
         model=model,
         error_code="provider_feature_unsupported",
         error_message=error["error"]["message"],
@@ -1582,7 +1586,7 @@ async def _websocket_provider_rejection(
     )
     await context.service.write_provider_rejection_log(
         api_key=api_key,
-        request_id=get_request_id(),
+        request_id=ensure_request_id(),
         model=None,
         error_code=error_code,
         error_message=error["error"]["message"],
@@ -1647,7 +1651,7 @@ def _provider_error(code: str, message: str, *, param: str | None = None) -> Ope
 
 def _openai_error_code(payload: Mapping[str, JsonValue]) -> str | None:
     error = payload.get("error")
-    if not isinstance(error, Mapping):
+    if not is_json_mapping(error):
         return None
     code = error.get("code")
     return code if isinstance(code, str) else None
@@ -1655,7 +1659,7 @@ def _openai_error_code(payload: Mapping[str, JsonValue]) -> str | None:
 
 def _openai_error_message(payload: Mapping[str, JsonValue]) -> str | None:
     error = payload.get("error")
-    if not isinstance(error, Mapping):
+    if not is_json_mapping(error):
         return None
     message = error.get("message")
     return message if isinstance(message, str) else None

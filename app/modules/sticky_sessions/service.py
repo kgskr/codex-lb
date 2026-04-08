@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import cast
 
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import StickySessionKind
@@ -13,7 +14,11 @@ from app.modules.sticky_sessions.schemas import (
     StickySessionSortBy,
     StickySessionSortDir,
 )
-from app.modules.upstream_identities.types import CHATGPT_WEB_PROVIDER_KIND, ProviderKind
+from app.modules.upstream_identities.types import (
+    CHATGPT_WEB_PROVIDER_KIND,
+    OPENAI_PLATFORM_PROVIDER_KIND,
+    ProviderKind,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +88,7 @@ class StickySessionsService:
         stale_cutoff = utcnow() - timedelta(seconds=ttl_seconds)
         normalized_account_query = account_query.strip() if account_query else None
         normalized_key_query = key_query.strip() if key_query else None
-        normalized_provider_kind = provider_kind.strip() if provider_kind else None
+        normalized_provider_kind = _normalize_provider_kind(provider_kind)
         stale_prompt_cache_count = await self._count_stale_prompt_cache_entries(
             kind=kind,
             stale_cutoff=stale_cutoff,
@@ -137,8 +142,8 @@ class StickySessionsService:
         entries: Sequence[tuple[str, StickySessionKind, ProviderKind]],
     ) -> StickySessionsDeleteData:
         failed: list[StickySessionDeleteFailureData] = []
-        seen: set[tuple[str, StickySessionKind, str]] = set()
-        targets: list[tuple[str, StickySessionKind, str]] = []
+        seen: set[tuple[str, StickySessionKind, ProviderKind]] = set()
+        targets: list[tuple[str, StickySessionKind, ProviderKind]] = []
 
         for key, kind, provider_kind in entries:
             if not key:
@@ -149,7 +154,11 @@ class StickySessionsService:
             seen.add(target)
             targets.append(target)
 
-        deleted = await self._repository.delete_entries_scoped(targets)
+        deleted_rows = await self._repository.delete_entries_scoped(targets)
+        deleted = cast(
+            "list[tuple[str, StickySessionKind, ProviderKind]]",
+            [(key, kind, _coerce_provider_kind(provider_kind)) for key, kind, provider_kind in deleted_rows],
+        )
         deleted_set = set(deleted)
 
         for key, kind, provider_kind in targets:
@@ -181,7 +190,7 @@ class StickySessionsService:
         effective_kind = StickySessionKind.PROMPT_CACHE if stale_only else kind
         normalized_account_query = account_query.strip() if account_query else None
         normalized_key_query = key_query.strip() if key_query else None
-        normalized_provider_kind = provider_kind.strip() if provider_kind else None
+        normalized_provider_kind = _normalize_provider_kind(provider_kind)
         targets = await self._repository.list_scoped_entry_identifiers(
             kind=effective_kind,
             updated_before=stale_cutoff if stale_only else None,
@@ -204,13 +213,14 @@ class StickySessionsService:
         if sticky_session.kind == StickySessionKind.PROMPT_CACHE:
             expires_at = to_utc_naive(sticky_session.updated_at) + timedelta(seconds=ttl_seconds)
             is_stale = expires_at <= utcnow()
+        provider_kind = _coerce_provider_kind(sticky_session.provider_kind)
         return StickySessionEntryData(
             key=sticky_session.key,
             display_name=row.display_name,
             kind=sticky_session.kind,
-            provider_kind=sticky_session.provider_kind,
+            provider_kind=provider_kind,
             routing_subject_id=sticky_session.routing_subject_id,
-            affinity_scope=self._affinity_scope(sticky_session.provider_kind, sticky_session.kind),
+            affinity_scope=self._affinity_scope(provider_kind, sticky_session.kind),
             created_at=sticky_session.created_at,
             updated_at=sticky_session.updated_at,
             expires_at=expires_at,
@@ -239,3 +249,17 @@ class StickySessionsService:
         if provider_kind == CHATGPT_WEB_PROVIDER_KIND:
             return "chatgpt_continuity"
         return "provider_scoped"
+
+
+def _normalize_provider_kind(provider_kind: ProviderKind | None) -> ProviderKind | None:
+    if provider_kind is None:
+        return None
+    return _coerce_provider_kind(provider_kind)
+
+
+def _coerce_provider_kind(provider_kind: str) -> ProviderKind:
+    if provider_kind == OPENAI_PLATFORM_PROVIDER_KIND:
+        return OPENAI_PLATFORM_PROVIDER_KIND
+    if provider_kind == CHATGPT_WEB_PROVIDER_KIND:
+        return CHATGPT_WEB_PROVIDER_KIND
+    return cast("ProviderKind", provider_kind)

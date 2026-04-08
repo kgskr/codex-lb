@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
@@ -20,6 +20,7 @@ from app.core.crypto import TokenEncryptor
 from app.core.openai.models import CompactResponsePayload, OpenAIResponsePayload
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.types import JsonValue
+from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.request_id import get_request_id
 from app.db.models import Account
 from app.modules.accounts.auth_manager import AuthManager
@@ -35,6 +36,15 @@ from app.modules.upstream_identities.types import (
 from app.modules.usage.updater import UsageUpdater
 
 logger = logging.getLogger(__name__)
+
+type _CompactResponsesCallable = Callable[
+    [ResponsesCompactRequest, Mapping[str, str], str, str | None],
+    Awaitable[CompactResponsePayload],
+]
+type _TranscribeAudioCallable = Callable[
+    ...,
+    Awaitable[dict[str, JsonValue]],
+]
 
 
 async def core_compact_responses(
@@ -254,7 +264,7 @@ class ChatGPTWebProviderAdapter:
     ) -> CompactResponsePayload:
         access_token, account_id = self._upstream_auth(subject)
         compact_impl = cast(
-            "Callable[[ResponsesCompactRequest, Mapping[str, str], str, str | None], object]",
+            _CompactResponsesCallable,
             _resolve_proxy_compat_callable("core_compact_responses", _DEFAULT_CORE_COMPACT_RESPONSES),
         )
         return await compact_impl(payload, headers, access_token, account_id)
@@ -295,7 +305,7 @@ class ChatGPTWebProviderAdapter:
     ) -> dict[str, JsonValue]:
         access_token, account_id = self._upstream_auth(subject)
         transcribe_impl = cast(
-            "Callable[..., object]",
+            _TranscribeAudioCallable,
             _resolve_proxy_compat_callable("core_transcribe_audio", _DEFAULT_CORE_TRANSCRIBE_AUDIO),
         )
         return await transcribe_impl(
@@ -607,7 +617,7 @@ class OpenAIPlatformProviderAdapter:
 
 def _platform_error_code(payload: Mapping[str, JsonValue]) -> str | None:
     error = payload.get("error")
-    if not isinstance(error, Mapping):
+    if not is_json_mapping(error):
         return None
     code = error.get("code")
     return code if isinstance(code, str) else None
@@ -615,7 +625,7 @@ def _platform_error_code(payload: Mapping[str, JsonValue]) -> str | None:
 
 def _platform_error_message(payload: Mapping[str, JsonValue]) -> str | None:
     error = payload.get("error")
-    if not isinstance(error, Mapping):
+    if not is_json_mapping(error):
         return None
     message = error.get("message")
     return message if isinstance(message, str) else None

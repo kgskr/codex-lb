@@ -524,10 +524,7 @@ async def test_run_startup_migrations_drops_accounts_email_unique_with_non_casca
             assert "routing_subject_id" in sticky_columns
             sticky_kind = (
                 await session.execute(
-                    text(
-                        "SELECT kind FROM sticky_sessions "
-                        "WHERE provider_kind='chatgpt_web' AND key='sticky_1'"
-                    )
+                    text("SELECT kind FROM sticky_sessions WHERE provider_kind='chatgpt_web' AND key='sticky_1'")
                 )
             ).scalar_one()
             assert sticky_kind == "sticky_thread"

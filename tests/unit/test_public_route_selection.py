@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -104,14 +105,17 @@ async def _repo_factory(
     identities: list[OpenAIPlatformIdentity] | None = None,
     sticky_repo: DummyStickyRepository | None = None,
 ) -> AsyncIterator[ProxyRepositories]:
-    yield ProxyRepositories(
-        accounts=SimpleNamespace(),
-        platform_identities=DummyPlatformIdentitiesRepository(identities or []),
-        usage=SimpleNamespace(),
-        request_logs=SimpleNamespace(),
-        sticky_sessions=sticky_repo or DummyStickyRepository(),
-        api_keys=SimpleNamespace(),
-        additional_usage=SimpleNamespace(),
+    yield cast(
+        ProxyRepositories,
+        SimpleNamespace(
+            accounts=SimpleNamespace(),
+            platform_identities=DummyPlatformIdentitiesRepository(identities or []),
+            usage=SimpleNamespace(),
+            request_logs=SimpleNamespace(),
+            sticky_sessions=sticky_repo or DummyStickyRepository(),
+            api_keys=SimpleNamespace(),
+            additional_usage=SimpleNamespace(),
+        ),
     )
 
 
@@ -439,9 +443,7 @@ async def test_load_balancer_select_routing_subject_discards_stale_platform_stic
 
     assert result.provider_kind == OPENAI_PLATFORM_PROVIDER_KIND
     assert result.routing_subject_id == "plat_1"
-    assert sticky_repo.delete_calls == [
-        ("cache-key", StickySessionKind.PROMPT_CACHE, OPENAI_PLATFORM_PROVIDER_KIND)
-    ]
+    assert sticky_repo.delete_calls == [("cache-key", StickySessionKind.PROMPT_CACHE, OPENAI_PLATFORM_PROVIDER_KIND)]
 
 
 @pytest.mark.asyncio
@@ -468,8 +470,8 @@ async def test_platform_only_public_route_rejection_respects_api_key_account_sco
         assigned_account_ids=["acc_scoped"],
     )
     result = await proxy_api_module._should_reject_platform_only_public_route(
-        context=SimpleNamespace(service=DummyService()),
-        api_key=api_key,
+        context=cast(Any, SimpleNamespace(service=DummyService())),
+        api_key=cast(Any, api_key),
         route_family=PUBLIC_RESPONSES_HTTP_ROUTE_FAMILY,
         model="gpt-5.1",
     )

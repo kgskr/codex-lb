@@ -5,11 +5,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 import app.modules.proxy.provider_adapters as provider_adapters_module
 from app.core.crypto import TokenEncryptor
+from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.utils.request_id import reset_request_id, set_request_id
 from app.db.models import Account, AccountStatus
 from app.modules.proxy.provider_adapters import (
@@ -18,9 +20,30 @@ from app.modules.proxy.provider_adapters import (
     ProviderSubject,
     RequestCapabilities,
 )
+from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.upstream_identities.types import OPENAI_PLATFORM_PROVIDER_KIND, PUBLIC_RESPONSES_HTTP_ROUTE_FAMILY
 
 pytestmark = pytest.mark.unit
+
+
+def _compact_request() -> ResponsesCompactRequest:
+    return ResponsesCompactRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "summarize",
+            "input": "hello",
+        }
+    )
+
+
+def _responses_request() -> ResponsesRequest:
+    return ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "hi",
+            "input": "hi",
+        }
+    )
 
 
 def _account(account_id: str = "acc_test") -> Account:
@@ -53,8 +76,8 @@ async def test_chatgpt_adapter_ensure_ready_delegates_to_auth_manager(monkeypatc
             return refreshed
 
     @asynccontextmanager
-    async def repo_factory() -> AsyncIterator[object]:
-        yield SimpleNamespace(accounts=object())
+    async def repo_factory() -> AsyncIterator[ProxyRepositories]:
+        yield cast(ProxyRepositories, SimpleNamespace(accounts=object()))
 
     monkeypatch.setattr(provider_adapters_module, "AuthManager", DummyAuthManager)
 
@@ -82,22 +105,23 @@ async def test_chatgpt_adapter_refresh_usage_delegates_to_usage_updater(monkeypa
         async def refresh_accounts(self, accounts, latest_usage) -> None:
             calls.append(([account.id for account in accounts], latest_usage))
 
-    repos = SimpleNamespace(
-        usage=SimpleNamespace(latest_by_account=lambda window="primary": {"acc_test": object()}),
-        accounts=object(),
-        additional_usage=object(),
-    )
-
     async def latest_by_account(window: str = "primary"):
         assert window == "primary"
         return {"acc_test": object()}
 
-    repos.usage.latest_by_account = latest_by_account
+    repos = cast(
+        ProxyRepositories,
+        SimpleNamespace(
+            usage=SimpleNamespace(latest_by_account=latest_by_account),
+            accounts=object(),
+            additional_usage=object(),
+        ),
+    )
     monkeypatch.setattr(provider_adapters_module, "UsageUpdater", DummyUsageUpdater)
 
     @asynccontextmanager
-    async def repo_factory() -> AsyncIterator[object]:
-        yield SimpleNamespace(accounts=object())
+    async def repo_factory() -> AsyncIterator[ProxyRepositories]:
+        yield cast(ProxyRepositories, SimpleNamespace(accounts=object()))
 
     adapter = ChatGPTWebProviderAdapter(repo_factory)
     await adapter.refresh_usage(
@@ -112,7 +136,7 @@ async def test_chatgpt_adapter_refresh_usage_delegates_to_usage_updater(monkeypa
 @pytest.mark.asyncio
 async def test_chatgpt_adapter_compact_response_delegates_to_core_client(monkeypatch) -> None:
     async def fake_compact(payload, headers, access_token, account_id):
-        assert payload == "payload"
+        assert payload.model == "gpt-5.1"
         assert headers == {"x-test": "1"}
         assert access_token == "access"
         assert account_id == "workspace-acc_test"
@@ -121,13 +145,13 @@ async def test_chatgpt_adapter_compact_response_delegates_to_core_client(monkeyp
     monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fake_compact)
 
     @asynccontextmanager
-    async def repo_factory() -> AsyncIterator[object]:
-        yield SimpleNamespace(accounts=object())
+    async def repo_factory() -> AsyncIterator[ProxyRepositories]:
+        yield cast(ProxyRepositories, SimpleNamespace(accounts=object()))
 
     adapter = ChatGPTWebProviderAdapter(repo_factory)
     result = await adapter.compact_response(
         ProviderSubject(provider_kind="chatgpt_web", routing_subject_id="acc_test", account=_account()),
-        "payload",
+        _compact_request(),
         {"x-test": "1"},
     )
 
@@ -145,7 +169,7 @@ async def test_chatgpt_adapter_stream_response_events_delegates_to_core_client(m
         raise_for_status,
         upstream_stream_transport_override,
     ):
-        assert payload == "payload"
+        assert payload.model == "gpt-5.1"
         assert headers == {"x-test": "1"}
         assert access_token == "access"
         assert account_id == "workspace-acc_test"
@@ -157,13 +181,13 @@ async def test_chatgpt_adapter_stream_response_events_delegates_to_core_client(m
     monkeypatch.setattr(provider_adapters_module, "core_stream_responses", fake_stream)
 
     @asynccontextmanager
-    async def repo_factory() -> AsyncIterator[object]:
-        yield SimpleNamespace(accounts=object())
+    async def repo_factory() -> AsyncIterator[ProxyRepositories]:
+        yield cast(ProxyRepositories, SimpleNamespace(accounts=object()))
 
     adapter = ChatGPTWebProviderAdapter(repo_factory)
     stream = await adapter.stream_response_events(
         ProviderSubject(provider_kind="chatgpt_web", routing_subject_id="acc_test", account=_account()),
-        "payload",
+        _responses_request(),
         {"x-test": "1"},
         raise_for_status=True,
         upstream_stream_transport="http",
@@ -196,8 +220,8 @@ async def test_chatgpt_adapter_transcribe_audio_delegates_to_core_client(monkeyp
     monkeypatch.setattr(provider_adapters_module, "core_transcribe_audio", fake_transcribe)
 
     @asynccontextmanager
-    async def repo_factory() -> AsyncIterator[object]:
-        yield SimpleNamespace(accounts=object())
+    async def repo_factory() -> AsyncIterator[ProxyRepositories]:
+        yield cast(ProxyRepositories, SimpleNamespace(accounts=object()))
 
     adapter = ChatGPTWebProviderAdapter(repo_factory)
     result = await adapter.transcribe_audio(
@@ -225,8 +249,8 @@ async def test_chatgpt_adapter_open_responses_websocket_delegates_to_transport(m
     monkeypatch.setattr(provider_adapters_module, "connect_responses_websocket", fake_connect)
 
     @asynccontextmanager
-    async def repo_factory() -> AsyncIterator[object]:
-        yield SimpleNamespace(accounts=object())
+    async def repo_factory() -> AsyncIterator[ProxyRepositories]:
+        yield cast(ProxyRepositories, SimpleNamespace(accounts=object()))
 
     adapter = ChatGPTWebProviderAdapter(repo_factory)
     result = await adapter.open_responses_websocket(

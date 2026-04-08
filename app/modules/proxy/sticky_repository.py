@@ -123,8 +123,7 @@ class StickySessionsRepository:
         row = await self.get_scoped_entry(key, kind=kind, provider_kind=provider_kind)
         if row is None:
             raise RuntimeError(
-                "StickySession upsert failed for "
-                f"provider_kind={provider_kind!r} key={key!r} kind={kind.value!r}"
+                f"StickySession upsert failed for provider_kind={provider_kind!r} key={key!r} kind={kind.value!r}"
             )
         await self._session.refresh(row)
         return row
@@ -148,20 +147,14 @@ class StickySessionsRepository:
         self,
         entries: Sequence[tuple[str, StickySessionKind]],
     ) -> list[tuple[str, StickySessionKind]]:
-        deleted = await self.delete_entries_scoped(
-            [(key, kind, CHATGPT_WEB_PROVIDER_KIND) for key, kind in entries]
-        )
+        deleted = await self.delete_entries_scoped([(key, kind, CHATGPT_WEB_PROVIDER_KIND) for key, kind in entries])
         return [(key, kind) for key, kind, _provider_kind in deleted]
 
     async def delete_entries_scoped(
         self,
         entries: Sequence[tuple[str, StickySessionKind, str]],
     ) -> list[tuple[str, StickySessionKind, str]]:
-        targets = {
-            (key, kind, provider_kind)
-            for key, kind, provider_kind in entries
-            if key
-        }
+        targets = {(key, kind, provider_kind) for key, kind, provider_kind in entries if key}
         if not targets:
             return []
         statement = delete(StickySession).where(

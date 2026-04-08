@@ -475,6 +475,67 @@ async def test_v1_responses_keeps_chatgpt_primary_when_usage_is_healthy(async_cl
 
 
 @pytest.mark.asyncio
+async def test_v1_responses_routes_using_enforced_api_key_model(async_client, monkeypatch):
+    raw_account_id = "acc_resp_enforced_model"
+    expected_account_id = await _import_account(async_client, raw_account_id, "resp-enforced@example.com")
+    await _seed_primary_usage(expected_account_id, 10.0)
+    await _create_platform_identity(async_client, monkeypatch, route_families=["public_responses_http"])
+
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "responses-enforced-model",
+            "allowedModels": ["gpt-5.1"],
+            "enforcedModel": "gpt-5.1",
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    async def fail_create_platform_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, payload, api_key, organization, project
+        raise AssertionError("enforced ChatGPT model should prevent platform fallback or rejection")
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kw):
+        del headers, access_token, base_url, raise_for_status, _kw
+        assert payload.model == "gpt-5.1"
+        assert account_id == raw_account_id
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_chatgpt_enforced","status":"completed",'
+            '"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}\n\n'
+        )
+
+    monkeypatch.setattr(provider_adapters_module, "create_platform_response", fail_create_platform_response)
+    monkeypatch.setattr(provider_adapters_module, "core_stream_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "platform-only-model", "input": "hi"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "resp_chatgpt_enforced"
+    assert payload["status"] == "completed"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "chatgpt_web"
+    assert log.account_id == expected_account_id
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_falls_back_to_platform_for_stateless_requests(async_client, monkeypatch):
     account_id = await _import_account(async_client, "acc_resp_fallback", "resp-fallback@example.com")
     await _seed_primary_usage(account_id, 95.0)
