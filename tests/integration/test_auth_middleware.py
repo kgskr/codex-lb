@@ -196,9 +196,7 @@ async def test_remote_insecure_no_auth_bypasses_dashboard_and_proxy_auth(app_ins
                     "httpResponsesSessionBridgeGatewaySafeMode": current_settings[
                         "httpResponsesSessionBridgeGatewaySafeMode"
                     ],
-                    "stickyReallocationBudgetThresholdPct": current_settings[
-                        "stickyReallocationBudgetThresholdPct"
-                    ],
+                    "stickyReallocationBudgetThresholdPct": current_settings["stickyReallocationBudgetThresholdPct"],
                     "importWithoutOverwrite": current_settings["importWithoutOverwrite"],
                     "totpRequiredOnLogin": current_settings["totpRequiredOnLogin"],
                     "apiKeyAuthEnabled": current_settings["apiKeyAuthEnabled"],

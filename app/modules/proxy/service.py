@@ -363,7 +363,7 @@ class ProxyService:
         )
 
         if is_models_route:
-            identity = await self.select_platform_identity(capabilities.route_family)  # type: ignore[arg-type]
+            identity = await self.select_platform_identity(capabilities.route_family)
             if has_chatgpt:
                 should_fallback = await self.should_fallback_to_platform_for_usage_drain(
                     model=None,
@@ -412,7 +412,7 @@ class ProxyService:
                         routing_subject_id="chatgpt_web_pool",
                     )
                 )
-            identity = await self.select_platform_identity(capabilities.route_family)  # type: ignore[arg-type]
+            identity = await self.select_platform_identity(capabilities.route_family)
             if identity is None:
                 return ProviderSelectionResult()
             decision = platform_adapter.check_capabilities(
@@ -430,7 +430,7 @@ class ProxyService:
                         routing_subject_id="chatgpt_web_pool",
                     )
                 )
-            identity = await self.select_platform_identity(capabilities.route_family)  # type: ignore[arg-type]
+            identity = await self.select_platform_identity(capabilities.route_family)
             if identity is None:
                 return ProviderSelectionResult()
             decision = platform_adapter.check_capabilities(
@@ -439,7 +439,7 @@ class ProxyService:
             )
             return self._provider_selection_failure(decision, capabilities)
 
-        identity = await self.select_platform_identity(capabilities.route_family)  # type: ignore[arg-type]
+        identity = await self.select_platform_identity(capabilities.route_family)
         if has_chatgpt:
             should_fallback = await self.should_fallback_to_platform_for_usage_drain(
                 model=capabilities.model,
@@ -521,7 +521,7 @@ class ProxyService:
         route_class: str = OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
     ) -> PlatformModelsResponse | None:
         if identity is None:
-            identity = await self.select_platform_identity(route_family)  # type: ignore[arg-type]
+            identity = await self.select_platform_identity(route_family)
         if identity is None:
             return None
         adapter = cast(OpenAIPlatformProviderAdapter, self._provider_adapter(OPENAI_PLATFORM_PROVIDER_KIND))
@@ -575,7 +575,7 @@ class ProxyService:
         route_family: str = PUBLIC_RESPONSES_HTTP_ROUTE_FAMILY,
     ) -> tuple[_SelectedPlatformIdentity | None, PlatformStreamResponse | None]:
         if identity is None:
-            identity = await self.select_platform_identity(route_family)  # type: ignore[arg-type]
+            identity = await self.select_platform_identity(route_family)
         if identity is None:
             return None, None
         adapter = cast(OpenAIPlatformProviderAdapter, self._provider_adapter(OPENAI_PLATFORM_PROVIDER_KIND))
@@ -602,7 +602,7 @@ class ProxyService:
         route_family: str = PUBLIC_RESPONSES_HTTP_ROUTE_FAMILY,
     ) -> tuple[_SelectedPlatformIdentity | None, PlatformResponseResult | None]:
         if identity is None:
-            identity = await self.select_platform_identity(route_family)  # type: ignore[arg-type]
+            identity = await self.select_platform_identity(route_family)
         if identity is None:
             return None, None
         adapter = cast(OpenAIPlatformProviderAdapter, self._provider_adapter(OPENAI_PLATFORM_PROVIDER_KIND))

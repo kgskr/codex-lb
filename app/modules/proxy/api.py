@@ -1005,15 +1005,12 @@ async def responses_compact(
             route_class=CHATGPT_PRIVATE_ROUTE_CLASS,
             rejection_reason="backend_codex_compact_platform_unsupported",
         )
-        return cast(
-            JSONResponse,
-            _logged_error_json_response(
-                request,
-                400,
-                error,
-                route_class=CHATGPT_PRIVATE_ROUTE_CLASS,
-                rejection_reason="backend_codex_compact_platform_unsupported",
-            ),
+        return _logged_error_json_response(
+            request,
+            400,
+            error,
+            route_class=CHATGPT_PRIVATE_ROUTE_CLASS,
+            rejection_reason="backend_codex_compact_platform_unsupported",
         )
     return await _compact_responses(
         request, payload, context, api_key, codex_session_affinity=True, openai_cache_affinity=True

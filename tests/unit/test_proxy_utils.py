@@ -6,8 +6,9 @@ import logging
 from collections import deque
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Protocol, Self, cast
+from typing import Any, Protocol, Self, TypedDict, cast
 from unittest.mock import AsyncMock
 
 import anyio
@@ -31,7 +32,7 @@ from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
-from app.modules.api_keys.service import ApiKeyData
+from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
 from app.modules.proxy import api as proxy_api
 from app.modules.proxy import request_policy as proxy_request_policy
 from app.modules.proxy import service as proxy_service
@@ -521,24 +522,37 @@ def _repo_factory(request_logs: _RequestLogsRecorder) -> proxy_service.ProxyRepo
     return factory
 
 
-def _make_proxy_settings(*, log_proxy_service_tier_trace: bool) -> object:
-    return SimpleNamespace(
-        prefer_earlier_reset_accounts=False,
-        sticky_threads_enabled=False,
-        sticky_reallocation_budget_threshold_pct=95.0,
-        upstream_stream_transport="default",
-        openai_cache_affinity_max_age_seconds=300,
-        openai_prompt_cache_key_derivation_enabled=True,
-        routing_strategy="usage_weighted",
-        proxy_request_budget_seconds=75.0,
-        compact_request_budget_seconds=75.0,
-        transcription_request_budget_seconds=120.0,
-        upstream_compact_timeout_seconds=None,
-        http_responses_session_bridge_gateway_safe_mode=False,
-        log_proxy_request_payload=False,
-        log_proxy_request_shape=False,
-        log_proxy_request_shape_raw_cache_key=False,
-        log_proxy_service_tier_trace=log_proxy_service_tier_trace,
+@dataclass
+class _ProxySettings:
+    prefer_earlier_reset_accounts: bool = False
+    sticky_threads_enabled: bool = False
+    sticky_reallocation_budget_threshold_pct: float = 95.0
+    upstream_stream_transport: str = "default"
+    openai_cache_affinity_max_age_seconds: int = 300
+    openai_prompt_cache_key_derivation_enabled: bool = True
+    routing_strategy: str = "usage_weighted"
+    proxy_request_budget_seconds: float = 75.0
+    compact_request_budget_seconds: float = 75.0
+    transcription_request_budget_seconds: float = 120.0
+    upstream_compact_timeout_seconds: float | None = None
+    http_responses_session_bridge_gateway_safe_mode: bool = False
+    http_responses_session_bridge_codex_prewarm_enabled: bool = False
+    log_proxy_request_payload: bool = False
+    log_proxy_request_shape: bool = False
+    log_proxy_request_shape_raw_cache_key: bool = False
+    log_proxy_service_tier_trace: bool = False
+    image_inline_allowed_hosts: list[str] = field(default_factory=list)
+
+
+def _make_proxy_settings(*, log_proxy_service_tier_trace: bool) -> _ProxySettings:
+    return _ProxySettings(log_proxy_service_tier_trace=log_proxy_service_tier_trace)
+
+
+def _reservation(reservation_id: str, *, model: str = "gpt-5.1") -> ApiKeyUsageReservationData:
+    return ApiKeyUsageReservationData(
+        reservation_id=reservation_id,
+        key_id="key_test",
+        model=model,
     )
 
 
@@ -621,18 +635,24 @@ class _SsePostResponse:
 
 
 class _SseSession:
+    class _PostCall(TypedDict):
+        url: str
+        json: dict[str, object] | None
+        headers: dict[str, str] | None
+        timeout: object | None
+
     def __init__(self, response: _SsePostResponse) -> None:
         self._response = response
-        self.calls: list[dict[str, object]] = []
+        self.calls: list[_SseSession._PostCall] = []
 
     def post(
         self,
         url: str,
         *,
-        json=None,
+        json: dict[str, object] | None = None,
         headers: dict[str, str] | None = None,
-        timeout=None,
-    ):
+        timeout: object | None = None,
+    ) -> _SsePostResponse:
         self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
         return self._response
 
@@ -932,7 +952,7 @@ async def test_release_reservation_swallows_cancelled_error(monkeypatch, caplog)
     monkeypatch.setattr(proxy_api, "ApiKeysService", _FakeService)
 
     with caplog.at_level(logging.WARNING):
-        await proxy_api._release_reservation(SimpleNamespace(reservation_id="res_test"))
+        await proxy_api._release_reservation(_reservation("res_test"))
 
     assert "Failed to release API key usage reservation" in caplog.text
 
@@ -958,7 +978,7 @@ async def test_release_websocket_reservation_swallows_cancelled_error(monkeypatc
     monkeypatch.setattr(proxy_service, "ApiKeysService", _FakeService)
 
     with caplog.at_level(logging.WARNING):
-        await service._release_websocket_reservation(SimpleNamespace(reservation_id="ws_res_test"))
+        await service._release_websocket_reservation(_reservation("ws_res_test"))
 
     assert "Failed to release websocket API key reservation" in caplog.text
 
@@ -984,7 +1004,7 @@ async def test_release_websocket_reservation_swallows_repository_error(monkeypat
     monkeypatch.setattr(proxy_service, "ApiKeysService", _FakeService)
 
     with caplog.at_level(logging.WARNING):
-        await service._release_websocket_reservation(SimpleNamespace(reservation_id="ws_res_error"))
+        await service._release_websocket_reservation(_reservation("ws_res_error"))
 
     assert "Failed to release websocket API key reservation" in caplog.text
 
@@ -1366,7 +1386,8 @@ async def test_stream_responses_normalizes_fast_service_tier_to_priority_for_cha
     ]
 
     assert events == ['data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n']
-    assert session.calls[0]["json"]["service_tier"] == "priority"
+    request_json = cast(dict[str, object], session.calls[0]["json"])
+    assert request_json["service_tier"] == "priority"
 
 
 @pytest.mark.asyncio
@@ -1380,7 +1401,7 @@ async def test_submit_http_bridge_request_releases_reservation_when_cancelled_be
             raise asyncio.CancelledError
 
     session = proxy_service._HTTPBridgeSession(
-        key=SimpleNamespace(affinity_kind="codex_session", api_key_id=None),
+        key=proxy_service._HTTPBridgeSessionKey("codex_session", "turn_1", None),
         headers={},
         affinity=proxy_service._AffinityPolicy(),
         account=_make_account("acc_bridge_cancel"),
@@ -1404,7 +1425,7 @@ async def test_submit_http_bridge_request_releases_reservation_when_cancelled_be
         model="gpt-5.1",
         service_tier="priority",
         reasoning_effort=None,
-        api_key_reservation=SimpleNamespace(reservation_id="res_bridge_cancel"),
+        api_key_reservation=_reservation("res_bridge_cancel"),
         started_at=0.0,
     )
     reservation = request_state.api_key_reservation
@@ -1418,7 +1439,7 @@ async def test_submit_http_bridge_request_releases_reservation_when_cancelled_be
             request_state=request_state,
             text_data='{"type":"response.create"}',
             queue_limit=8,
-    )
+        )
 
     assert session.queued_request_count == 0
     assert list(session.pending_requests) == []
@@ -1432,7 +1453,7 @@ async def test_cleanup_unregistered_websocket_request_releases_gate_and_reservat
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     release_reservation = AsyncMock()
     response_create_gate = asyncio.Semaphore(0)
-    reservation = SimpleNamespace(reservation_id="res_ws_unregistered")
+    reservation = _reservation("res_ws_unregistered")
     request_state = proxy_service._WebSocketRequestState(
         request_id="ws_unregistered_req",
         model="gpt-5.1",
