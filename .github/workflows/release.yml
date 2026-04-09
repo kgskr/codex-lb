@@ -125,7 +125,7 @@ jobs:
 
   publish-to-pypi:
     name: Publish to PyPI
-    if: ${{ !contains(env.RELEASE_TAG, '-') }}
+    if: ${{ !contains(github.event.release.tag_name || inputs.tag, '-') }}
     needs: [build]
     runs-on: ubuntu-24.04
 
