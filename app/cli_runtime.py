@@ -134,9 +134,7 @@ def start_background_server(
     env["PYTHONUNBUFFERED"] = "1"
 
     if os.name == "nt":
-        creationflags = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-        )
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
 
     with resolved_log_file.open("ab") as log_handle:
         if os.name == "nt":
@@ -175,10 +173,7 @@ def start_background_server(
     ):
         terminate_process(metadata.pid)
         remove_runtime_metadata(resolved_pid_file)
-        raise RuntimeError(
-            "background server failed readiness checks; "
-            f"see log file {resolved_log_file}"
-        )
+        raise RuntimeError(f"background server failed readiness checks; see log file {resolved_log_file}")
 
     return metadata
 
@@ -227,10 +222,7 @@ def shutdown_background_server(
             return metadata
         time.sleep(0.2)
 
-    raise RuntimeError(
-        f"timed out waiting for pid {metadata.pid} to stop "
-        f"(pid file: {pid_file.expanduser()})"
-    )
+    raise RuntimeError(f"timed out waiting for pid {metadata.pid} to stop (pid file: {pid_file.expanduser()})")
 
 
 def terminate_process(pid: int) -> None:

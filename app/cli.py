@@ -99,10 +99,7 @@ def _run_background_start(args: argparse.Namespace) -> None:
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
 
-    print(
-        "Started codex-lb-cinamon in background "
-        f"(pid {metadata.pid}, {metadata.host}:{metadata.port})"
-    )
+    print(f"Started codex-lb-cinamon in background (pid {metadata.pid}, {metadata.host}:{metadata.port})")
     print(f"PID file: {args.pid_file.expanduser()}")
     print(f"Log file: {Path(metadata.log_file).expanduser()}")
 
@@ -116,10 +113,7 @@ def _run_status(args: argparse.Namespace) -> None:
             print("codex-lb-cinamon background server is not running.")
         raise SystemExit(1)
 
-    print(
-        "codex-lb-cinamon background server is running "
-        f"(pid {metadata.pid}, {metadata.host}:{metadata.port})"
-    )
+    print(f"codex-lb-cinamon background server is running (pid {metadata.pid}, {metadata.host}:{metadata.port})")
     print(f"PID file: {args.pid_file.expanduser()}")
     print(f"Log file: {Path(metadata.log_file).expanduser()}")
 
@@ -142,6 +136,7 @@ def _run_shutdown(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
     print(f"Stopped codex-lb-cinamon background server (pid {stopped.pid}).")
+
 
 def main() -> None:
     args = _parse_args()
