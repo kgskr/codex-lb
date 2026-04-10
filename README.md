@@ -134,7 +134,33 @@ Docker를 쓴다면 아래 CIDR 설정도 함께 주는 편이 안전합니다.
 
 1. 대시보드에 접속합니다.
 2. ChatGPT 계정과 Platform API Key를 추가합니다.
-4. 클라이언트에서 `codex-lb-cinamon` 엔드포인트를 사용하도록 설정합니다.
+3. 클라이언트에서 `codex-lb-cinamon` 엔드포인트를 사용하도록 설정합니다.
+
+### Platform API Key 등록
+
+대시보드에서 Platform 키를 넣을 때는 `Accounts` 페이지에서 `Add OpenAI Platform API key`를 사용하면 됩니다.
+
+입력 항목:
+
+- `Label`: 대시보드에서 구분할 이름
+- `API key`: OpenAI Platform API 키
+- `Organization`, `Project`: 쓰는 경우만 입력, 비워둬도 됨
+
+중요:
+
+- Platform API key는 단독으로 쓸 수 없습니다. 먼저 활성 ChatGPT 계정이 최소 1개 있어야 등록됩니다.
+- `Eligible routes`를 하나도 체크하지 않으면 등록은 되어도 실제 라우팅에는 쓰이지 않습니다.
+
+Codex app이나 Codex CLI에 붙일 거면 `Eligible routes`의 체크박스 3개를 **전부 체크**하세요.
+
+- `Fallback HTTP /v1/models`
+- `Fallback stateless HTTP /v1/responses`
+- `Fallback HTTP /backend-api/codex`
+
+가장 단순한 기준으로 보면:
+
+- Codex app / Codex CLI 사용: 위 3개 전부 체크
+- 일반 OpenAI 호환 `/v1` 클라이언트만 사용: 보통 `/v1/models`, `/v1/responses` 쪽만 체크하면 됨
 
 ## 클라이언트 연결
 
@@ -152,20 +178,46 @@ OpenAI 호환 클라이언트는 모두 `codex-lb-cinamon`을 upstream처럼 사
 
 `~/.codex/config.toml`:
 
+가장 쉽게 말하면:
+
+- `model_provider = "codex-lb-cinamon"` 는 파일 맨 위에 넣습니다.
+- `[model_providers.codex-lb-cinamon]` 블록은 파일 맨 아래에 넣습니다.
+
+1. 먼저 아래 1줄을 파일 **맨 위**에 넣습니다.
+   - `[ ... ]` 로 시작하는 다른 섹션 안에 넣으면 안 됩니다.
+   - `model` 이나 `model_reasoning_effort` 는 여기서 건드릴 필요 없습니다.
+   - 이미 `model_provider`가 있다면 그 값만 `codex-lb-cinamon`으로 바꾸면 됩니다.
+
 ```toml
-model = "gpt-5.3-codex"
-model_reasoning_effort = "xhigh"
 model_provider = "codex-lb-cinamon"
-# 아래 부분만 붙여 넣으세요.
+```
+
+2. 그다음 아래 **공급자 정의 블록**을 파일 **맨 아래**에 그대로 붙여 넣습니다.
+   - 이 블록은 다른 `[ ... ]` 섹션들 아래에 따로 들어가면 됩니다.
+
+```toml
 [model_providers.codex-lb-cinamon]
 name = "OpenAI"
 base_url = "http://127.0.0.1:2455/backend-api/codex"
 wire_api = "responses"
 ```
 
-API 키 인증을 켠 경우:
+즉, 최종 파일 모양은 아래처럼 됩니다.
 
 ```toml
+model_provider = "codex-lb-cinamon"
+
+[model_providers.codex-lb-cinamon]
+name = "OpenAI"
+base_url = "http://127.0.0.1:2455/backend-api/codex"
+wire_api = "responses"
+```
+
+codex-lb-cinamon의 API 키 인증을 켠 경우에는 아래처럼 추가합니다.
+
+```toml
+model_provider = "codex-lb-cinamon"
+
 [model_providers.codex-lb-cinamon]
 name = "OpenAI"
 base_url = "http://127.0.0.1:2455/backend-api/codex"
@@ -179,6 +231,13 @@ requires_openai_auth = true
 export CODEX_LB_API_KEY="sk-clb-..."
 codex
 ```
+
+정리하면:
+
+- `model_provider = "codex-lb-cinamon"`: 최상위 설정
+- `[model_providers.codex-lb-cinamon]`: 공급자 상세 정의 블록
+- 두 이름 `codex-lb-cinamon`은 반드시 서로 같아야 합니다.
+- `model` / `model_reasoning_effort` 는 기존 Codex 설정을 그대로 써도 됩니다.
 
 추가 메모:
 
