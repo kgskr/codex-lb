@@ -6,7 +6,7 @@ import { PlatformIdentityDialog } from "@/features/accounts/components/platform-
 import { createAccountSummary } from "@/test/mocks/factories";
 
 describe("PlatformIdentityDialog", () => {
-  it("submits a provider-aware platform identity payload with zero enabled routes by default", async () => {
+  it("submits a provider-aware platform identity payload with automatic fallback scope", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     const onOpenChange = vi.fn();
@@ -29,26 +29,14 @@ describe("PlatformIdentityDialog", () => {
     await user.type(screen.getByLabelText("Project"), "proj_test");
 
     expect(screen.getByText(/Register a fallback-only upstream identity for/i)).toBeInTheDocument();
-    expect(screen.getAllByText("/v1/models").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("/v1/responses").length).toBeGreaterThan(0);
-    expect(screen.getByText("/backend-api/codex HTTP")).toBeInTheDocument();
+    expect(screen.getByText("All supported fallback paths are enabled automatically for this key.")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Allow this identity to handle stateless HTTP Responses API calls only. Stateless HTTP only; compact, chat completions, websocket, and continuity-bound requests stay on ChatGPT.",
+        /It can back \/v1\/models, stateless HTTP \/v1\/responses, stateless HTTP \/v1\/responses\/compact/,
       ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(
-        "Allow this identity to back Codex HTTP models and stateless HTTP responses only. Compact, websocket, and continuity-bound Codex requests stay on ChatGPT.",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("No route families enabled. This identity stays unroutable until you opt into one."),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Requires an existing ChatGPT account that is not paused or deactivated. Only one Platform API key can be registered, and it is used only as fallback for enabled /v1/models, stateless /v1/responses, /backend-api/codex/models, and stateless /backend-api/codex/responses routes.",
-      ),
+      screen.getByText("Websocket and continuity-bound requests stay on ChatGPT."),
     ).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Add API key" }));
@@ -58,7 +46,6 @@ describe("PlatformIdentityDialog", () => {
       apiKey: "sk-platform-test",
       organization: "org_test",
       project: "proj_test",
-      eligibleRouteFamilies: [],
     });
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
@@ -110,7 +97,7 @@ describe("PlatformIdentityDialog", () => {
           routingSubjectId: "platform_1",
           organization: "org_original",
           project: "proj_original",
-          eligibleRouteFamilies: ["public_models_http", "public_responses_http"],
+          eligibleRouteFamilies: ["public_models_http", "public_responses_http", "backend_codex_http"],
           usage: null,
           auth: null,
         })}
@@ -130,14 +117,12 @@ describe("PlatformIdentityDialog", () => {
     await user.type(screen.getByLabelText("Label"), "Platform Renamed");
     await user.clear(screen.getByLabelText("Organization"));
     await user.clear(screen.getByLabelText("Project"));
-    await user.click(screen.getAllByRole("checkbox")[0]);
     await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     expect(onSubmit).toHaveBeenCalledWith({
       label: "Platform Renamed",
       organization: null,
       project: null,
-      eligibleRouteFamilies: ["public_responses_http"],
     });
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
@@ -161,7 +146,7 @@ describe("PlatformIdentityDialog", () => {
           planType: "openai_platform",
           providerKind: "openai_platform",
           routingSubjectId: "platform_2",
-          eligibleRouteFamilies: [],
+          eligibleRouteFamilies: ["public_models_http", "public_responses_http", "backend_codex_http"],
           usage: null,
           auth: null,
         })}
@@ -172,7 +157,7 @@ describe("PlatformIdentityDialog", () => {
 
     expect(
       screen.getByText(
-        "This key can back /v1/models, stateless HTTP /v1/responses, /backend-api/codex/models, and stateless HTTP /backend-api/codex/responses only when the matching route families are enabled. Compact, websocket, and continuity-bound requests stay on ChatGPT.",
+        "Path selection is no longer configurable. This key always covers the full supported fallback scope.",
       ),
     ).toBeInTheDocument();
 

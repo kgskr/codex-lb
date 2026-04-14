@@ -1,14 +1,18 @@
 # command-line-runtime-control Specification
 
-## ADDED Requirements
+## Purpose
 
-### Requirement: Bare CLI invocation remains a foreground server start
+Define the CLI lifecycle contract for running the API server in the foreground or as a tracked background process.
 
-The CLI MUST continue to start the API server in the foreground when invoked without a lifecycle subcommand. The explicit `serve` subcommand MUST run the same foreground server path and MUST accept the same bind and TLS options.
+## Requirements
+
+### Requirement: Bare CLI invocation and `serve` both run the foreground server
+
+The CLI MUST preserve backward-compatible foreground startup when invoked without a lifecycle subcommand. The explicit `serve` subcommand MUST run the same foreground server path and MUST accept the same bind and TLS options as the bare invocation path.
 
 #### Scenario: Operator runs the bare command
 
-- **WHEN** the operator runs `codex-lb-cinamon` with optional host/port/SSL flags but no subcommand
+- **WHEN** the operator runs `codex-lb-cinamon` with optional host, port, or TLS flags but no subcommand
 - **THEN** the CLI launches the uvicorn server in the current process using the requested bind settings
 
 #### Scenario: Operator runs `serve`
@@ -45,7 +49,7 @@ The CLI MUST provide a `start` subcommand that launches a detached background se
 - **THEN** the CLI removes the stale PID file
 - **AND** it proceeds with a fresh background start
 
-#### Scenario: Background start cleans up after an early failure
+#### Scenario: Background start cleans up after an early readiness failure
 
 - **WHEN** the operator runs `codex-lb-cinamon start`
 - **AND** the child process exits before readiness succeeds or readiness times out

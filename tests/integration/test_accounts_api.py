@@ -11,15 +11,22 @@ import app.modules.proxy.provider_adapters as provider_adapters_module
 from app.core.auth import generate_unique_account_id
 from app.core.clients.openai_platform import OpenAIPlatformError, PlatformModelsResponse
 from app.core.utils.time import utcnow
-from app.db.models import AccountStatus, RequestLog, StickySession, StickySessionKind
+from app.db.models import AccountStatus, OpenAIPlatformIdentity, RequestLog, StickySession, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.upstream_identities.repository import (
     OpenAIPlatformIdentitiesRepository,
     OpenAIPlatformIdentityConflictError,
     OpenAIPlatformIdentityCreate,
+    split_route_families,
 )
 
 pytestmark = pytest.mark.integration
+
+EXPECTED_PLATFORM_ROUTE_FAMILIES = [
+    "backend_codex_http",
+    "public_models_http",
+    "public_responses_http",
+]
 
 
 def _encode_jwt(payload: dict) -> str:
@@ -168,7 +175,6 @@ async def test_list_accounts_includes_platform_request_usage(async_client, monke
         json={
             "label": "Platform Usage",
             "apiKey": "sk-platform-usage",
-            "eligibleRouteFamilies": ["public_responses_http"],
         },
     )
     assert create_response.status_code == 200
@@ -264,7 +270,6 @@ async def test_create_platform_identity_conflict_is_enforced_even_if_service_pre
         json={
             "label": "Platform Primary",
             "apiKey": "sk-platform-primary",
-            "eligibleRouteFamilies": ["public_models_http"],
         },
     )
     assert first_response.status_code == 200
@@ -274,7 +279,6 @@ async def test_create_platform_identity_conflict_is_enforced_even_if_service_pre
         json={
             "label": "Platform Secondary",
             "apiKey": "sk-platform-secondary",
-            "eligibleRouteFamilies": ["public_responses_http"],
         },
     )
     assert second_response.status_code == 409
@@ -324,7 +328,6 @@ async def test_update_platform_identity_updates_metadata_without_revalidating_la
             "apiKey": "sk-platform-original",
             "organization": "org_original",
             "project": "proj_original",
-            "eligibleRouteFamilies": ["public_models_http"],
         },
     )
     assert create_response.status_code == 200
@@ -341,7 +344,6 @@ async def test_update_platform_identity_updates_metadata_without_revalidating_la
         f"/api/accounts/platform/{account_id}",
         json={
             "label": "Platform Renamed",
-            "eligibleRouteFamilies": ["public_models_http", "public_responses_http"],
         },
     )
     assert update_response.status_code == 200
@@ -350,7 +352,7 @@ async def test_update_platform_identity_updates_metadata_without_revalidating_la
     assert payload["label"] == "Platform Renamed"
     assert payload["organization"] == "org_original"
     assert payload["project"] == "proj_original"
-    assert sorted(payload["eligibleRouteFamilies"]) == ["public_models_http", "public_responses_http"]
+    assert payload["eligibleRouteFamilies"] == EXPECTED_PLATFORM_ROUTE_FAMILIES
     assert update_validation_calls == []
 
 
@@ -391,7 +393,6 @@ async def test_update_platform_identity_revalidates_auth_affecting_fields(async_
             "apiKey": "sk-platform-original",
             "organization": "org_original",
             "project": "proj_original",
-            "eligibleRouteFamilies": ["public_models_http"],
         },
     )
     assert create_response.status_code == 200
@@ -452,7 +453,6 @@ async def test_update_platform_identity_revalidates_key_rotation(async_client, m
             "apiKey": "sk-platform-original",
             "organization": "org_original",
             "project": "proj_original",
-            "eligibleRouteFamilies": ["public_models_http"],
         },
     )
     assert create_response.status_code == 200
@@ -514,7 +514,6 @@ async def test_update_platform_identity_surfaces_auth_failure_reason_for_rotated
         json={
             "label": "Platform Auth Failure",
             "apiKey": "sk-platform-original",
-            "eligibleRouteFamilies": ["public_models_http"],
         },
     )
     assert create_response.status_code == 200
@@ -577,7 +576,6 @@ async def test_delete_platform_identity_cleans_up_provider_scoped_sticky_session
         json={
             "label": "Platform Delete",
             "apiKey": "sk-platform-delete",
-            "eligibleRouteFamilies": ["public_responses_http"],
         },
     )
     assert create_response.status_code == 200
@@ -644,7 +642,7 @@ async def test_update_platform_identity_returns_404_for_chatgpt_account(async_cl
 
 
 @pytest.mark.asyncio
-async def test_update_platform_identity_rejects_invalid_route_family(async_client, monkeypatch):
+async def test_update_platform_identity_ignores_legacy_route_family_payload(async_client, monkeypatch):
     async def fake_validate_platform_identity(self, *, api_key, organization=None, project=None):
         del self, api_key, organization, project
         return PlatformModelsResponse(
@@ -681,11 +679,50 @@ async def test_update_platform_identity_rejects_invalid_route_family(async_clien
     assert create_response.status_code == 200
     account_id = create_response.json()["accountId"]
 
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(OpenAIPlatformIdentity).where(OpenAIPlatformIdentity.id == account_id)
+        )
+        identity = result.scalar_one()
+        assert list(split_route_families(identity.eligible_route_families)) == EXPECTED_PLATFORM_ROUTE_FAMILIES
+
     update_response = await async_client.patch(
         f"/api/accounts/platform/{account_id}",
-        json={"eligibleRouteFamilies": ["not_a_real_route_family"]},
+        json={"eligibleRouteFamilies": ["backend_codex_http"]},
     )
-    assert update_response.status_code == 422
+    assert update_response.status_code == 200
+    assert update_response.json()["eligibleRouteFamilies"] == EXPECTED_PLATFORM_ROUTE_FAMILIES
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(OpenAIPlatformIdentity).where(OpenAIPlatformIdentity.id == account_id)
+        )
+        identity = result.scalar_one()
+        assert list(split_route_families(identity.eligible_route_families)) == EXPECTED_PLATFORM_ROUTE_FAMILIES
+
+
+@pytest.mark.asyncio
+async def test_create_platform_identity_rejects_blank_required_strings(async_client):
+    import_response = await async_client.post(
+        "/api/accounts/import",
+        files={
+            "auth_json": (
+                "auth.json",
+                json.dumps(_make_auth_json("acc_platform_blank_create", "platform-blank-create@example.com")),
+                "application/json",
+            )
+        },
+    )
+    assert import_response.status_code == 200
+
+    response = await async_client.post(
+        "/api/accounts/platform",
+        json={
+            "label": "   ",
+            "apiKey": "   ",
+        },
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -699,7 +736,7 @@ async def test_platform_identity_repository_enforces_singleton(async_client):
             api_key_encrypted=b"encrypted-1",
             organization_id=None,
             project_id=None,
-            eligible_route_families=(),
+            eligible_route_families=tuple(EXPECTED_PLATFORM_ROUTE_FAMILIES),
             status=AccountStatus.ACTIVE,
             last_validated_at=None,
             last_auth_failure_reason=None,
@@ -710,7 +747,7 @@ async def test_platform_identity_repository_enforces_singleton(async_client):
             api_key_encrypted=b"encrypted-2",
             organization_id=None,
             project_id=None,
-            eligible_route_families=(),
+            eligible_route_families=tuple(EXPECTED_PLATFORM_ROUTE_FAMILIES),
             status=AccountStatus.ACTIVE,
             last_validated_at=None,
             last_auth_failure_reason=None,

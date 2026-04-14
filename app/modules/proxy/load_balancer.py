@@ -572,6 +572,7 @@ class LoadBalancer:
         secondary_remaining_threshold = float(
             getattr(settings, "platform_fallback_secondary_remaining_threshold_pct", 5.0)
         )
+        prefer_earlier_reset_accounts = bool(getattr(settings, "prefer_earlier_reset_accounts", False))
 
         considered_states = [
             state for state in states if state.status not in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED)
@@ -583,8 +584,16 @@ class LoadBalancer:
             return True
 
         if any(
-            _is_chatgpt_state_healthy_for_platform_fallback(
-                state,
+            (
+                selected_state := _select_state_for_platform_fallback(
+                    state,
+                    allow_rate_limit_grace=False,
+                    prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
+                )
+            )
+            is not None
+            and _is_chatgpt_state_healthy_for_platform_fallback(
+                selected_state,
                 primary_remaining_threshold=primary_remaining_threshold,
                 secondary_remaining_threshold=secondary_remaining_threshold,
             )
@@ -593,6 +602,113 @@ class LoadBalancer:
             return False
 
         return True
+
+    async def has_compatible_chatgpt_candidates(
+        self,
+        *,
+        model: str | None = None,
+        additional_limit_name: str | None = None,
+        account_ids: Collection[str] | None = None,
+    ) -> bool:
+        selection_inputs = await self._load_selection_inputs(
+            model=model,
+            additional_limit_name=additional_limit_name,
+            account_ids=account_ids,
+        )
+        if not selection_inputs.accounts:
+            return False
+
+        self._prune_runtime(selection_inputs.runtime_accounts or selection_inputs.accounts)
+        states, _account_map = _build_states(
+            accounts=selection_inputs.accounts,
+            latest_primary=selection_inputs.latest_primary,
+            latest_secondary=selection_inputs.latest_secondary,
+            runtime=self._runtime,
+        )
+        return any(state.status not in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED) for state in states)
+
+    async def chatgpt_compatibility_failure(
+        self,
+        *,
+        model: str | None = None,
+        additional_limit_name: str | None = None,
+        account_ids: Collection[str] | None = None,
+    ) -> tuple[str | None, str | None]:
+        selection_inputs = await self._load_selection_inputs(
+            model=model,
+            additional_limit_name=additional_limit_name,
+            account_ids=account_ids,
+        )
+        if selection_inputs.accounts:
+            return None, None
+        return selection_inputs.error_code, selection_inputs.error_message
+
+    async def sticky_chatgpt_target_is_healthy_for_platform_fallback(
+        self,
+        *,
+        sticky_key: str | None,
+        sticky_kind: StickySessionKind | None,
+        sticky_max_age_seconds: int | None = None,
+        model: str | None = None,
+        additional_limit_name: str | None = None,
+        account_ids: Collection[str] | None = None,
+    ) -> bool:
+        if not sticky_key or sticky_kind is None:
+            return False
+
+        async with self._repo_factory() as repos:
+            sticky_repo = repos.sticky_sessions
+            if sticky_repo is None:
+                return False
+            sticky_target = await sticky_repo.get_target(
+                sticky_key,
+                kind=sticky_kind,
+                provider_kind=CHATGPT_WEB_PROVIDER_KIND,
+                max_age_seconds=sticky_max_age_seconds,
+            )
+
+        if sticky_target is None or sticky_target.account_id is None:
+            return False
+
+        selection_inputs = await self._load_selection_inputs(
+            model=model,
+            additional_limit_name=additional_limit_name,
+            account_ids=account_ids,
+        )
+        if not selection_inputs.accounts:
+            return False
+
+        self._prune_runtime(selection_inputs.runtime_accounts or selection_inputs.accounts)
+        states, _account_map = _build_states(
+            accounts=selection_inputs.accounts,
+            latest_primary=selection_inputs.latest_primary,
+            latest_secondary=selection_inputs.latest_secondary,
+            runtime=self._runtime,
+        )
+        pinned_state = next((state for state in states if state.account_id == sticky_target.account_id), None)
+        if pinned_state is None or pinned_state.status in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED):
+            return False
+
+        settings = get_settings()
+        primary_remaining_threshold = float(
+            getattr(settings, "platform_fallback_primary_remaining_threshold_pct", 10.0)
+        )
+        secondary_remaining_threshold = float(
+            getattr(settings, "platform_fallback_secondary_remaining_threshold_pct", 5.0)
+        )
+        prefer_earlier_reset_accounts = bool(getattr(settings, "prefer_earlier_reset_accounts", False))
+        selected_state = _select_state_for_platform_fallback(
+            pinned_state,
+            allow_rate_limit_grace=True,
+            prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
+        )
+        if selected_state is None:
+            return False
+        return _is_chatgpt_state_healthy_for_platform_fallback(
+            selected_state,
+            primary_remaining_threshold=primary_remaining_threshold,
+            secondary_remaining_threshold=secondary_remaining_threshold,
+        )
 
     async def _load_selection_inputs(
         self,
@@ -1216,6 +1332,35 @@ def _is_chatgpt_state_healthy_for_platform_fallback(
         and primary_remaining > primary_remaining_threshold
         and secondary_remaining > secondary_remaining_threshold
     )
+
+
+def _select_state_for_platform_fallback(
+    state: AccountState,
+    *,
+    allow_rate_limit_grace: bool,
+    prefer_earlier_reset_accounts: bool = False,
+    routing_strategy: RoutingStrategy = "capacity_weighted",
+) -> AccountState | None:
+    selected = select_account(
+        [replace(state)],
+        prefer_earlier_reset=prefer_earlier_reset_accounts,
+        routing_strategy=routing_strategy,
+        allow_backoff_fallback=False,
+    )
+    if selected.account is not None:
+        return selected.account
+
+    if allow_rate_limit_grace and state.status == AccountStatus.RATE_LIMITED:
+        grace_result = select_account(
+            [replace(state)],
+            now=time.time() + _STICKY_GRACE_PERIOD_SECONDS,
+            prefer_earlier_reset=prefer_earlier_reset_accounts,
+            routing_strategy=routing_strategy,
+            allow_backoff_fallback=False,
+        )
+        return grace_result.account
+
+    return None
 
 
 def _state_from_account(

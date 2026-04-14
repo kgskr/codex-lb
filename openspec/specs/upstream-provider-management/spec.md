@@ -10,7 +10,8 @@ The system SHALL allow operators to manage upstream identities for at least two 
 
 #### Scenario: Operator creates an OpenAI Platform upstream identity
 - **WHEN** the operator creates an `openai_platform` upstream identity
-- **THEN** the dashboard collects a human label, encrypted API key material, optional organization or project metadata, and route-family eligibility settings drawn from the fixed phase-1 enum
+- **THEN** the dashboard collects a human label, encrypted API key material, and optional organization or project metadata
+- **AND** the system automatically applies the fixed phase-1 supported route-family set for that identity
 - **AND** the system stores that identity without requiring ChatGPT OAuth tokens, `refresh_token`, `id_token`, or `chatgpt_account_id`
 
 #### Scenario: Platform identity requires an existing ChatGPT-web pool
@@ -59,22 +60,22 @@ The system MUST apply credential lifecycle behavior according to provider kind. 
 - **AND** it stops selecting that identity for new requests until the operator repairs or re-enables it
 
 ### Requirement: Mixed-provider routing policy is explicit
-The system MUST expose an explicit route-family eligibility policy for each upstream identity. In phase 1, `openai_platform` identities are opt-in for a fixed enum of eligible route families, are fallback-only behind the existing ChatGPT pool, and are not silently merged into unsupported ChatGPT-private behavior.
+The system MUST expose an explicit route-family eligibility policy for each upstream identity. In phase 1, `openai_platform` identities are fallback-only behind the existing ChatGPT pool, automatically enable the full supported route-family set, and are not silently merged into unsupported ChatGPT-private behavior.
 
-#### Scenario: Platform identity is disabled for supported route families by default
+#### Scenario: Platform identity enables every supported route family by default
 - **WHEN** an operator adds an `openai_platform` upstream identity
-- **AND** the operator has not enabled any supported route families for that identity
-- **THEN** the router excludes that identity from request selection
+- **THEN** the router stores the full supported phase-1 route-family set for that identity
+- **AND** the dashboard/API does not require the operator to opt into individual route families
 
-#### Scenario: Platform identity is eligible only for enabled route families
-- **WHEN** an operator enables a subset of route families for an `openai_platform` identity
-- **THEN** the router considers that identity only for those route families
-- **AND** it continues excluding the identity from unsupported websocket, compact, and continuity-dependent phase-1 behavior
+#### Scenario: Platform identity remains eligible for the full supported route-family set on update
+- **WHEN** an operator updates an existing `openai_platform` identity
+- **THEN** the router keeps that identity eligible for the full supported route-family set
+- **AND** it continues excluding the identity from unsupported websocket and continuity-dependent phase-1 behavior
 
-#### Scenario: Codex backend HTTP route family is independently controllable
-- **WHEN** the system exposes route-family eligibility controls for `openai_platform`
+#### Scenario: Codex backend HTTP route family stays part of the supported Platform scope
+- **WHEN** the system exposes the supported route-family policy for `openai_platform`
 - **THEN** the supported enum includes `backend_codex_http`
-- **AND** operators may enable `backend_codex_http` without enabling public `/v1/*` route families
+- **AND** a registered Platform identity stays eligible for `backend_codex_http` alongside the other supported route families
 
 #### Scenario: Healthy ChatGPT-web pool stays primary for supported public routes
 - **WHEN** a request targets an eligible public HTTP route
@@ -88,7 +89,7 @@ The system MUST expose an explicit route-family eligibility policy for each upst
 - **AND** both `chatgpt_web` and `openai_platform` identities are configured for that route family
 - **AND** no compatible ChatGPT-web candidate remains healthy under the configured fallback thresholds
 - **THEN** the service MAY select the Platform identity as fallback for that request
-- **AND** it does so only for `/v1/models`, stateless HTTP `/v1/responses`, `/backend-api/codex/models`, or stateless HTTP `/backend-api/codex/responses`
+- **AND** it does so only for `/v1/models`, stateless HTTP `/v1/responses`, stateless HTTP `/v1/responses/compact`, `/backend-api/codex/models`, stateless HTTP `/backend-api/codex/responses`, or stateless HTTP `/backend-api/codex/responses/compact`
 
 #### Scenario: Phase-1 route-family enum is fixed and testable
 - **WHEN** the system exposes route-family eligibility controls for `openai_platform`
@@ -97,7 +98,7 @@ The system MUST expose an explicit route-family eligibility policy for each upst
 
 ### Requirement: Platform fallback uses the remaining percentages visible to operators
 
-For phase-1 fallback, the service MUST treat a compatible ChatGPT-web candidate as healthy only while both persisted usage snapshots required for fallback evaluation are present and their remaining percentages satisfy `primary_remaining_percent > 10` and `secondary_remaining_percent > 5`. Compatible candidates with either snapshot missing MUST NOT count as healthy for suppressing Platform fallback. When no compatible ChatGPT-web candidate remains positively healthy under those thresholds, the service MAY consider `openai_platform` as fallback, subject to the existing route-family eligibility checks.
+For phase-1 fallback, the service MUST treat a compatible ChatGPT-web candidate as healthy only while it remains selectable for the request and both persisted usage snapshots required for fallback evaluation are present with `primary_remaining_percent > 10` and `secondary_remaining_percent > 5`. Compatible candidates with either snapshot missing MUST NOT count as healthy for suppressing Platform fallback. Candidates that are still rate-limited, quota-blocked, paused, or deactivated MUST NOT suppress Platform fallback based on persisted remaining percentages alone. A durable backend Codex `codex_session` affinity MAY still suppress Platform fallback for its pinned ChatGPT-web account when that pinned target becomes selectable within the sticky grace window and remains above the same remaining-percent thresholds at that grace-window selection point. When no compatible ChatGPT-web candidate remains positively healthy under those thresholds, the service MAY consider `openai_platform` as fallback, subject to the existing route-family eligibility checks.
 
 #### Scenario: A compatible ChatGPT-web candidate with more than 10 percent primary remaining and more than 5 percent secondary remaining keeps Platform idle
 
@@ -113,6 +114,12 @@ For phase-1 fallback, the service MUST treat a compatible ChatGPT-web candidate 
 - **AND** each compatible ChatGPT-web candidate has `primary_remaining_percent <= 10` or `secondary_remaining_percent <= 5`
 - **THEN** the service MAY select the Platform identity as fallback for that request
 
+#### Scenario: Blocked candidates do not suppress Platform fallback
+- **WHEN** a request targets an eligible Platform fallback route family
+- **AND** every compatible ChatGPT-web candidate is currently unselectable because it is still rate-limited, quota-blocked, paused, or deactivated
+- **THEN** the service MAY treat the ChatGPT pool as drained for Platform fallback
+- **AND** persisted remaining percentages on those blocked candidates MUST NOT keep the request on ChatGPT by themselves
+
 #### Scenario: Missing usage snapshots do not suppress Platform fallback
 
 - **WHEN** a request targets an eligible Platform fallback route family
@@ -126,14 +133,14 @@ For phase-1 fallback, the service MUST treat a compatible ChatGPT-web candidate 
 Each upstream identity MUST expose or derive a provider capability set that the router and balancer use before selection. The service MUST filter by provider capability before it chooses the concrete upstream identity for a request.
 
 #### Scenario: Platform identity is excluded from ChatGPT-private route selection
-- **WHEN** a request requires an unsupported ChatGPT-private capability such as backend Codex websocket transport or provider-owned compact semantics
+- **WHEN** a request requires an unsupported ChatGPT-private capability such as backend Codex websocket transport
 - **AND** the candidate upstream identity is `openai_platform`
 - **THEN** the selection process excludes that identity before the normal routing strategy runs
 
 #### Scenario: Eligible route family can fall back to Platform only after the compatible ChatGPT pool is drained
-- **WHEN** a request targets an eligible route family such as stateless HTTP `/v1/responses` or stateless HTTP `/backend-api/codex/responses`
+- **WHEN** a request targets an eligible route family such as stateless HTTP `/v1/responses`, stateless HTTP `/v1/responses/compact`, stateless HTTP `/backend-api/codex/responses`, or stateless HTTP `/backend-api/codex/responses/compact`
 - **AND** both `chatgpt_web` and `openai_platform` identities advertise support for the request
-- **AND** both are enabled for that route family by policy
+- **AND** the Platform identity carries the fixed supported route-family policy
 - **AND** no compatible ChatGPT-web candidate remains healthy under the configured fallback thresholds
 - **THEN** the service may route the request to the Platform identity as fallback
 - **AND** it MUST NOT treat Platform as an equal-weight member of the normal ChatGPT routing pool

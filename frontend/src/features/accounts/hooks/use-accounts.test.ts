@@ -40,7 +40,6 @@ describe("useAccounts", () => {
     const platformIdentity = await result.current.createPlatformMutation.mutateAsync({
       label: "Platform Key",
       apiKey: "sk-platform-test",
-      eligibleRouteFamilies: [],
     });
     await result.current.updatePlatformMutation.mutateAsync({
       accountId: platformIdentity.accountId,
@@ -69,14 +68,12 @@ describe("useAccounts", () => {
     await result.current.createPlatformMutation.mutateAsync({
       label: "Platform Key",
       apiKey: "sk-platform-test",
-      eligibleRouteFamilies: [],
     });
 
     await expect(
       result.current.createPlatformMutation.mutateAsync({
         label: "Second Platform Key",
         apiKey: "sk-platform-test-2",
-        eligibleRouteFamilies: [],
       }),
     ).rejects.toMatchObject({
       code: "platform_identity_conflict",
@@ -103,7 +100,6 @@ describe("useAccounts", () => {
       result.current.createPlatformMutation.mutateAsync({
         label: "Platform Without Primary",
         apiKey: "sk-platform-test",
-        eligibleRouteFamilies: [],
       }),
     ).rejects.toMatchObject({
       code: "platform_identity_prerequisite_failed",

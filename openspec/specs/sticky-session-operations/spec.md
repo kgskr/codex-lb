@@ -62,6 +62,29 @@ Each persisted mapping MUST use provider scope as part of its durable identity. 
 - **THEN** the service invalidates, drops, or ignores that mapping instead of reusing it
 - **AND** it MUST NOT reuse that mapping across provider kinds
 
+#### Scenario: SQLite single-instance runtime uses static bridge ring
+- **WHEN** the runtime uses a SQLite database
+- **AND** bridge routing is enabled without an explicit multi-instance ring configuration
+- **THEN** the service uses the static single-node bridge ring derived from the local instance id
+- **AND** it MUST NOT start persisted bridge-ring heartbeat writes
+- **AND** HTTP bridge owner checks MUST NOT query persisted ring membership for that runtime
+
+### Requirement: HTTP bridge instance ownership remains deterministic without unnecessary SQLite coordination
+
+The service MUST avoid unnecessary database-backed bridge ring coordination when a deployment can safely operate with a static single-instance ring.
+
+#### Scenario: SQLite-backed deployment uses static bridge ring membership
+- **WHEN** the deployment uses a SQLite database
+- **AND** the HTTP responses session bridge is enabled
+- **THEN** the service MUST NOT start periodic database-backed bridge ring registration or heartbeat tasks
+- **AND** request-path bridge ownership lookups MUST fall back to the normalized static ring derived from settings
+- **AND** HTTP bridge routing behavior for a single-instance deployment MUST remain deterministic
+
+#### Scenario: Non-SQLite deployment keeps dynamic bridge ring membership
+- **WHEN** the deployment uses a non-SQLite database
+- **AND** the HTTP responses session bridge is enabled
+- **THEN** the service MAY register and heartbeat bridge ring membership through the shared database
+
 ### Requirement: Dashboard exposes sticky-session administration
 The system SHALL provide dashboard APIs for listing sticky-session mappings, deleting one mapping, and purging stale mappings.
 

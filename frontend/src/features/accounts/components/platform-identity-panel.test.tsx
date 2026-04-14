@@ -29,9 +29,11 @@ describe("PlatformIdentityPanel", () => {
 
     expect(screen.getByText("Eligible fallback routes")).toBeInTheDocument();
     expect(screen.getByText(/Fallback HTTP \/v1\/models/)).toBeInTheDocument();
-    expect(screen.getByText(/Fallback stateless HTTP \/v1\/responses/)).toBeInTheDocument();
+    expect(screen.getByText(/Fallback stateless HTTP \/v1\/responses \+ \/v1\/responses\/compact/)).toBeInTheDocument();
     expect(
-      screen.getByText(/Fallback HTTP \/backend-api\/codex\/models \+ stateless HTTP \/backend-api\/codex\/responses/),
+      screen.getByText(
+        /Fallback HTTP \/backend-api\/codex\/models \+ stateless HTTP \/backend-api\/codex\/responses \+ \/backend-api\/codex\/responses\/compact/,
+      ),
     ).toBeInTheDocument();
     expect(screen.getByText(/Fallback only\./)).toBeInTheDocument();
     expect(
@@ -45,7 +47,7 @@ describe("PlatformIdentityPanel", () => {
       }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Compact, websocket, and continuity-bound requests stay on ChatGPT\./, {
+      screen.getByText(/Websocket and continuity-bound requests stay on ChatGPT\./, {
         exact: false,
       }),
     ).toBeInTheDocument();

@@ -9,7 +9,7 @@ from collections import deque
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import AsyncIterator, Mapping, NoReturn, cast
+from typing import AsyncIterator, Awaitable, Callable, Mapping, NoReturn, cast
 from uuid import uuid4
 
 import aiohttp
@@ -97,12 +97,14 @@ from app.modules.proxy.load_balancer import (
     AccountSelection,
     LoadBalancer,
     _filter_accounts_for_model,
+    _gated_limit_name_for_model,
 )
 from app.modules.proxy.provider_adapters import (
     ChatGPTWebProviderAdapter,
     OpenAIPlatformProviderAdapter,
     ProviderAdapter,
     ProviderCapabilityDecision,
+    ProviderCompactResponseResult,
     ProviderSubject,
     RequestCapabilities,
 )
@@ -133,6 +135,7 @@ from app.modules.proxy.types import (
 )
 from app.modules.upstream_identities.types import (
     BACKEND_CODEX_HTTP_ROUTE_FAMILY,
+    CHATGPT_PRIVATE_ROUTE_CLASS,
     CHATGPT_WEB_PROVIDER_KIND,
     OPENAI_PLATFORM_PROVIDER_KIND,
     OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
@@ -332,27 +335,104 @@ class ProxyService:
                 return bool(active_accounts)
             return bool(_filter_accounts_for_model(active_accounts, model))
 
+    async def has_compatible_chatgpt_candidates(
+        self,
+        model: str | None = None,
+        *,
+        additional_limit_name: str | None = None,
+        account_ids: Collection[str] | None = None,
+    ) -> bool:
+        return await self._load_balancer.has_compatible_chatgpt_candidates(
+            model=model,
+            additional_limit_name=additional_limit_name,
+            account_ids=account_ids,
+        )
+
+    async def chatgpt_compatibility_failure(
+        self,
+        model: str | None = None,
+        *,
+        additional_limit_name: str | None = None,
+        account_ids: Collection[str] | None = None,
+    ) -> tuple[str | None, str | None]:
+        return await self._load_balancer.chatgpt_compatibility_failure(
+            model=model,
+            additional_limit_name=additional_limit_name,
+            account_ids=account_ids,
+        )
+
     async def should_fallback_to_platform_for_usage_drain(
         self,
         *,
         model: str | None,
+        additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
     ) -> bool:
         return await self._load_balancer.should_fallback_to_platform_for_usage_drain(
             model=model,
+            additional_limit_name=additional_limit_name,
             account_ids=account_ids,
         )
+
+    async def sticky_chatgpt_target_is_healthy_for_platform_fallback(
+        self,
+        *,
+        sticky_key: str | None,
+        sticky_kind: StickySessionKind | None,
+        sticky_max_age_seconds: int | None,
+        model: str | None,
+        additional_limit_name: str | None = None,
+        account_ids: Collection[str] | None = None,
+    ) -> bool:
+        return await self._load_balancer.sticky_chatgpt_target_is_healthy_for_platform_fallback(
+            sticky_key=sticky_key,
+            sticky_kind=sticky_kind,
+            sticky_max_age_seconds=sticky_max_age_seconds,
+            model=model,
+            additional_limit_name=additional_limit_name,
+            account_ids=account_ids,
+        )
+
+    @staticmethod
+    def _hard_affinity_for_provider_fallback(
+        *,
+        sticky_key: str | None,
+        sticky_kind: StickySessionKind | None,
+    ) -> bool:
+        return bool(sticky_key) and sticky_kind == StickySessionKind.CODEX_SESSION
+
+    @staticmethod
+    def _platform_affinity_for_selection(
+        *,
+        sticky_key: str | None,
+        sticky_kind: StickySessionKind | None,
+        reallocate_sticky: bool,
+        sticky_max_age_seconds: int | None,
+    ) -> tuple[str | None, StickySessionKind | None, bool, int | None]:
+        if sticky_key and sticky_kind == StickySessionKind.PROMPT_CACHE:
+            return sticky_key, sticky_kind, reallocate_sticky, sticky_max_age_seconds
+        return None, None, False, None
 
     async def select_routing_subject(
         self,
         *,
         capabilities: RequestCapabilities,
         api_key: ApiKeyData | None = None,
+        sticky_key: str | None = None,
+        sticky_kind: StickySessionKind | None = None,
+        reallocate_sticky: bool = False,
+        sticky_max_age_seconds: int | None = None,
     ) -> ProviderSelectionResult:
         scoped_account_ids = (
             api_key.assigned_account_ids if api_key is not None and api_key.account_assignment_scope_enabled else None
         )
-        has_chatgpt = await self.has_chatgpt_candidates(capabilities.model, account_ids=scoped_account_ids)
+        additional_limit_name = _gated_limit_name_for_model(capabilities.model)
+        has_active_chatgpt = await self.has_chatgpt_candidates(account_ids=scoped_account_ids)
+        has_compatible_chatgpt = await self.has_compatible_chatgpt_candidates(
+            capabilities.model,
+            additional_limit_name=additional_limit_name,
+            account_ids=scoped_account_ids,
+        )
         platform_adapter = cast(
             OpenAIPlatformProviderAdapter,
             self._provider_adapter(OPENAI_PLATFORM_PROVIDER_KIND),
@@ -364,7 +444,7 @@ class ProxyService:
 
         if is_models_route:
             identity = await self.select_platform_identity(capabilities.route_family)
-            if has_chatgpt:
+            if has_active_chatgpt:
                 should_fallback = await self.should_fallback_to_platform_for_usage_drain(
                     model=None,
                     account_ids=scoped_account_ids,
@@ -404,7 +484,7 @@ class ProxyService:
             return ProviderSelectionResult()
 
         if capabilities.transport == _REQUEST_TRANSPORT_WEBSOCKET:
-            if has_chatgpt:
+            if has_compatible_chatgpt:
                 return ProviderSelectionResult(
                     selected=SelectedChatGPTSubject(
                         provider_kind=CHATGPT_WEB_PROVIDER_KIND,
@@ -414,6 +494,29 @@ class ProxyService:
                 )
             identity = await self.select_platform_identity(capabilities.route_family)
             if identity is None:
+                if has_active_chatgpt:
+                    error_code, error_message = await self.chatgpt_compatibility_failure(
+                        capabilities.model,
+                        additional_limit_name=additional_limit_name,
+                        account_ids=scoped_account_ids,
+                    )
+                    if error_code is not None and error_message is not None:
+                        return ProviderSelectionResult(
+                            failure=ProviderSelectionFailure(
+                                http_status=400,
+                                error_code=error_code,
+                                error_message=error_message,
+                                rejection_reason=error_code,
+                                route_class=capabilities.route_class,
+                            )
+                        )
+                    return ProviderSelectionResult(
+                        selected=SelectedChatGPTSubject(
+                            provider_kind=CHATGPT_WEB_PROVIDER_KIND,
+                            route_class=capabilities.route_class,
+                            routing_subject_id="chatgpt_web_pool",
+                        )
+                    )
                 return ProviderSelectionResult()
             decision = platform_adapter.check_capabilities(
                 self._platform_provider_subject(identity),
@@ -422,7 +525,7 @@ class ProxyService:
             return self._provider_selection_failure(decision, capabilities)
 
         if capabilities.continuity_param is not None:
-            if has_chatgpt:
+            if has_compatible_chatgpt:
                 return ProviderSelectionResult(
                     selected=SelectedChatGPTSubject(
                         provider_kind=CHATGPT_WEB_PROVIDER_KIND,
@@ -432,6 +535,29 @@ class ProxyService:
                 )
             identity = await self.select_platform_identity(capabilities.route_family)
             if identity is None:
+                if has_active_chatgpt:
+                    error_code, error_message = await self.chatgpt_compatibility_failure(
+                        capabilities.model,
+                        additional_limit_name=additional_limit_name,
+                        account_ids=scoped_account_ids,
+                    )
+                    if error_code is not None and error_message is not None:
+                        return ProviderSelectionResult(
+                            failure=ProviderSelectionFailure(
+                                http_status=400,
+                                error_code=error_code,
+                                error_message=error_message,
+                                rejection_reason=error_code,
+                                route_class=capabilities.route_class,
+                            )
+                        )
+                    return ProviderSelectionResult(
+                        selected=SelectedChatGPTSubject(
+                            provider_kind=CHATGPT_WEB_PROVIDER_KIND,
+                            route_class=capabilities.route_class,
+                            routing_subject_id="chatgpt_web_pool",
+                        )
+                    )
                 return ProviderSelectionResult()
             decision = platform_adapter.check_capabilities(
                 self._platform_provider_subject(identity),
@@ -440,12 +566,50 @@ class ProxyService:
             return self._provider_selection_failure(decision, capabilities)
 
         identity = await self.select_platform_identity(capabilities.route_family)
-        if has_chatgpt:
+        if has_compatible_chatgpt:
             should_fallback = await self.should_fallback_to_platform_for_usage_drain(
                 model=capabilities.model,
+                additional_limit_name=additional_limit_name,
                 account_ids=scoped_account_ids,
             )
+            if (
+                should_fallback
+                and not bool(getattr(get_settings(), "platform_fallback_force_enabled", False))
+                and self._hard_affinity_for_provider_fallback(
+                    sticky_key=sticky_key,
+                    sticky_kind=sticky_kind,
+                )
+            ):
+                sticky_chatgpt_healthy = await self.sticky_chatgpt_target_is_healthy_for_platform_fallback(
+                    sticky_key=sticky_key,
+                    sticky_kind=cast(StickySessionKind, sticky_kind),
+                    sticky_max_age_seconds=sticky_max_age_seconds,
+                    model=capabilities.model,
+                    additional_limit_name=additional_limit_name,
+                    account_ids=scoped_account_ids,
+                )
+                if sticky_chatgpt_healthy:
+                    should_fallback = False
             if should_fallback:
+                if identity is not None:
+                    (
+                        platform_sticky_key,
+                        platform_sticky_kind,
+                        platform_reallocate_sticky,
+                        platform_sticky_max_age_seconds,
+                    ) = self._platform_affinity_for_selection(
+                        sticky_key=sticky_key,
+                        sticky_kind=sticky_kind,
+                        reallocate_sticky=reallocate_sticky,
+                        sticky_max_age_seconds=sticky_max_age_seconds,
+                    )
+                    identity = await self.select_platform_identity(
+                        capabilities.route_family,
+                        sticky_key=platform_sticky_key,
+                        sticky_kind=platform_sticky_kind,
+                        reallocate_sticky=platform_reallocate_sticky,
+                        sticky_max_age_seconds=platform_sticky_max_age_seconds,
+                    )
                 if identity is not None:
                     decision = platform_adapter.check_capabilities(
                         self._platform_provider_subject(identity),
@@ -467,7 +631,22 @@ class ProxyService:
                     routing_subject_id="chatgpt_web_pool",
                 )
             )
-        if identity is not None:
+        if identity is not None and has_active_chatgpt:
+            decision = platform_adapter.check_capabilities(
+                self._platform_provider_subject(identity),
+                capabilities,
+            )
+            if decision.allowed:
+                return ProviderSelectionResult(
+                    selected=SelectedPlatformSubject(
+                        provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
+                        route_class=capabilities.route_class,
+                        routing_subject_id=identity.id,
+                        identity=identity,
+                    )
+                )
+            return self._provider_selection_failure(decision, capabilities)
+        if identity is not None and not has_active_chatgpt:
             return ProviderSelectionResult(
                 failure=ProviderSelectionFailure(
                     http_status=400,
@@ -475,6 +654,14 @@ class ProxyService:
                     error_message="OpenAI Platform fallback requires at least one active ChatGPT-web account.",
                     rejection_reason="platform_fallback_requires_chatgpt",
                     route_class=capabilities.route_class,
+                )
+            )
+        if has_active_chatgpt:
+            return ProviderSelectionResult(
+                selected=SelectedChatGPTSubject(
+                    provider_kind=CHATGPT_WEB_PROVIDER_KIND,
+                    route_class=capabilities.route_class,
+                    routing_subject_id="chatgpt_web_pool",
                 )
             )
         return ProviderSelectionResult()
@@ -487,6 +674,7 @@ class ProxyService:
         sticky_kind: StickySessionKind | None = None,
         reallocate_sticky: bool = False,
         sticky_max_age_seconds: int | None = None,
+        exclude_routing_subject_ids: Collection[str] | None = None,
     ) -> _SelectedPlatformIdentity | None:
         selection = await self._load_balancer.select_routing_subject(
             provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
@@ -495,6 +683,7 @@ class ProxyService:
             sticky_kind=sticky_kind,
             reallocate_sticky=reallocate_sticky,
             sticky_max_age_seconds=sticky_max_age_seconds,
+            exclude_routing_subject_ids=exclude_routing_subject_ids,
         )
         if selection.routing_subject_id is None:
             return None
@@ -529,7 +718,7 @@ class ProxyService:
         request_id = ensure_request_id()
         start = time.monotonic()
         try:
-            result = await adapter.fetch_models(subject)
+            result = await adapter.fetch_models(subject, route_class=route_class)
         except OpenAIPlatformError as exc:
             await self._record_platform_auth_failure(identity.id, exc)
             await self._write_request_log(
@@ -545,6 +734,7 @@ class ProxyService:
                 error_message=_platform_error_message(exc.payload),
                 route_class=route_class,
                 rejection_reason="platform_models_request_failed",
+                upstream_request_id=exc.upstream_request_id,
                 transport=_REQUEST_TRANSPORT_HTTP,
             )
             raise
@@ -573,6 +763,7 @@ class ProxyService:
         api_key: ApiKeyData | None,
         identity: _SelectedPlatformIdentity | None = None,
         route_family: str = PUBLIC_RESPONSES_HTTP_ROUTE_FAMILY,
+        route_class: str = OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
     ) -> tuple[_SelectedPlatformIdentity | None, PlatformStreamResponse | None]:
         if identity is None:
             identity = await self.select_platform_identity(route_family)
@@ -580,13 +771,31 @@ class ProxyService:
             return None, None
         adapter = cast(OpenAIPlatformProviderAdapter, self._provider_adapter(OPENAI_PLATFORM_PROVIDER_KIND))
         subject = self._platform_provider_subject(identity)
+        request_id = ensure_request_id()
+        start = time.monotonic()
         try:
             result = await adapter.stream_responses(
                 subject,
                 payload.model_dump(mode="json", exclude_none=True),
+                route_class=route_class,
             )
         except OpenAIPlatformError as exc:
             await self._record_platform_auth_failure(identity.id, exc)
+            await self.write_proxy_error_log(
+                account_id=None,
+                provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
+                routing_subject_id=identity.id,
+                api_key=api_key,
+                request_id=request_id,
+                model=payload.model,
+                error_code=_platform_error_code(exc.payload) or "upstream_error",
+                error_message=_platform_error_message(exc.payload) or "OpenAI Platform stream request failed",
+                route_class=route_class,
+                rejection_reason="platform_stream_request_failed",
+                upstream_request_id=exc.upstream_request_id,
+                transport=_REQUEST_TRANSPORT_HTTP,
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
             raise
         return identity, PlatformStreamResponse(
             event_stream=result.event_stream,
@@ -600,6 +809,7 @@ class ProxyService:
         api_key: ApiKeyData | None,
         identity: _SelectedPlatformIdentity | None = None,
         route_family: str = PUBLIC_RESPONSES_HTTP_ROUTE_FAMILY,
+        route_class: str = OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
     ) -> tuple[_SelectedPlatformIdentity | None, PlatformResponseResult | None]:
         if identity is None:
             identity = await self.select_platform_identity(route_family)
@@ -607,13 +817,31 @@ class ProxyService:
             return None, None
         adapter = cast(OpenAIPlatformProviderAdapter, self._provider_adapter(OPENAI_PLATFORM_PROVIDER_KIND))
         subject = self._platform_provider_subject(identity)
+        request_id = ensure_request_id()
+        start = time.monotonic()
         try:
             result = await adapter.create_response(
                 subject,
                 payload.model_dump(mode="json", exclude_none=True),
+                route_class=route_class,
             )
         except OpenAIPlatformError as exc:
             await self._record_platform_auth_failure(identity.id, exc)
+            await self.write_proxy_error_log(
+                account_id=None,
+                provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
+                routing_subject_id=identity.id,
+                api_key=api_key,
+                request_id=request_id,
+                model=payload.model,
+                error_code=_platform_error_code(exc.payload) or "upstream_error",
+                error_message=_platform_error_message(exc.payload) or "OpenAI Platform response request failed",
+                route_class=route_class,
+                rejection_reason="platform_response_request_failed",
+                upstream_request_id=exc.upstream_request_id,
+                transport=_REQUEST_TRANSPORT_HTTP,
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
             raise
         return identity, PlatformResponseResult(
             payload=result.payload,
@@ -632,19 +860,51 @@ class ProxyService:
         rejection_reason: str,
         transport: str = _REQUEST_TRANSPORT_HTTP,
     ) -> None:
-        await self._write_request_log(
+        await self.write_proxy_error_log(
             account_id=None,
             provider_kind=None,
             routing_subject_id=None,
             api_key=api_key,
             request_id=request_id,
             model=model,
-            latency_ms=0,
+            error_code=error_code,
+            error_message=error_message,
+            route_class=route_class,
+            rejection_reason=rejection_reason,
+            transport=transport,
+        )
+
+    async def write_proxy_error_log(
+        self,
+        *,
+        account_id: str | None,
+        provider_kind: str | None,
+        routing_subject_id: str | None,
+        api_key: ApiKeyData | None,
+        request_id: str,
+        model: str | None,
+        error_code: str,
+        error_message: str,
+        route_class: str | None,
+        rejection_reason: str | None,
+        upstream_request_id: str | None = None,
+        transport: str = _REQUEST_TRANSPORT_HTTP,
+        latency_ms: int = 0,
+    ) -> None:
+        await self._write_request_log(
+            account_id=account_id,
+            provider_kind=provider_kind,
+            routing_subject_id=routing_subject_id,
+            api_key=api_key,
+            request_id=request_id,
+            model=model,
+            latency_ms=latency_ms,
             status="error",
             error_code=error_code,
             error_message=error_message,
             route_class=route_class,
             rejection_reason=rejection_reason,
+            upstream_request_id=upstream_request_id,
             transport=transport,
         )
 
@@ -656,11 +916,20 @@ class ProxyService:
             platform_identities = repos.platform_identities
             if platform_identities is None:
                 return
-            await platform_identities.update_validation_state(
+            updated = await platform_identities.update_validation_state(
                 identity_id,
                 last_validated_at=None,
                 last_auth_failure_reason=reason,
                 status=AccountStatus.DEACTIVATED,
+            )
+        if updated:
+            logger.warning(
+                "provider_health_transition request_id=%s provider_kind=%s routing_subject_id=%s status=%s reason=%s",
+                get_request_id(),
+                OPENAI_PLATFORM_PROVIDER_KIND,
+                identity_id,
+                AccountStatus.DEACTIVATED.value,
+                reason,
             )
 
     def stream_responses(
@@ -878,6 +1147,9 @@ class ProxyService:
         openai_cache_affinity: bool = False,
         api_key: ApiKeyData | None = None,
         api_key_reservation: ApiKeyUsageReservationData | None = None,
+        selected_subject: SelectedChatGPTSubject | SelectedPlatformSubject | None = None,
+        route_family: str = BACKEND_CODEX_HTTP_ROUTE_FAMILY,
+        route_class: str = CHATGPT_PRIVATE_ROUTE_CLASS,
     ) -> CompactResponsePayload:
         _maybe_log_proxy_request_payload("compact", payload, headers)
         filtered = filter_inbound_headers(headers)
@@ -886,11 +1158,15 @@ class ProxyService:
         base_settings = get_settings()
         deadline = start + base_settings.compact_request_budget_seconds
         account_id_value: str | None = None
+        provider_kind_value: str | None = None
+        routing_subject_id_value: str | None = None
+        upstream_request_id: str | None = None
+        log_rejection_reason: str | None = None
         log_status = "error"
         log_error_code: str | None = None
         log_error_message: str | None = None
         response: CompactResponsePayload | None = None
-        request_service_tier: str | None = None
+        request_service_tier = _normalize_service_tier_value(payload.service_tier)
         actual_service_tier: str | None = None
 
         settings = await get_settings_cache().get()
@@ -920,34 +1196,140 @@ class ProxyService:
         )
         routing_strategy = _routing_strategy(settings)
         try:
+            selected_subject = selected_subject or SelectedChatGPTSubject(
+                provider_kind=CHATGPT_WEB_PROVIDER_KIND,
+                route_class=route_class,
+                routing_subject_id="chatgpt_web_pool",
+            )
+            if isinstance(selected_subject, SelectedChatGPTSubject):
+                provider_kind_value = CHATGPT_WEB_PROVIDER_KIND
 
-            async def _call_compact(target: Account) -> CompactResponsePayload:
-                adapter = cast(ChatGPTWebProviderAdapter, self._provider_adapter(CHATGPT_WEB_PROVIDER_KIND))
+            async def _call_compact_timeout(
+                callback: Callable[[], Awaitable[ProviderCompactResponseResult]],
+            ) -> ProviderCompactResponseResult:
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
-                    logger.warning(
-                        "Compact request budget exhausted before upstream call request_id=%s account_id=%s",
-                        request_id,
-                        target.id,
-                    )
+                    logger.warning("Compact request budget exhausted before upstream call request_id=%s", request_id)
                     _raise_proxy_budget_exhausted()
                 if base_settings.upstream_compact_timeout_seconds is None:
-                    timeout_tokens = push_compact_timeout_overrides(
-                        connect_timeout_seconds=remaining_budget,
-                    )
+                    timeout_tokens = push_compact_timeout_overrides(connect_timeout_seconds=remaining_budget)
                 else:
                     timeout_tokens = push_compact_timeout_overrides(
                         connect_timeout_seconds=remaining_budget,
                         total_timeout_seconds=remaining_budget,
                     )
                 try:
-                    return await adapter.compact_response(
+                    return await callback()
+                finally:
+                    pop_compact_timeout_overrides(timeout_tokens)
+
+            async def _call_chatgpt_compact(target: Account) -> ProviderCompactResponseResult:
+                adapter = cast(ChatGPTWebProviderAdapter, self._provider_adapter(CHATGPT_WEB_PROVIDER_KIND))
+                return await _call_compact_timeout(
+                    lambda: adapter.compact_response(
                         self._chatgpt_provider_subject(target),
                         payload,
                         filtered,
                     )
-                finally:
-                    pop_compact_timeout_overrides(timeout_tokens)
+                )
+
+            async def _call_platform_compact(
+                identity: _SelectedPlatformIdentity,
+            ) -> ProviderCompactResponseResult:
+                adapter = cast(OpenAIPlatformProviderAdapter, self._provider_adapter(OPENAI_PLATFORM_PROVIDER_KIND))
+                return await _call_compact_timeout(
+                    lambda: adapter.compact_response(
+                        self._platform_provider_subject(identity),
+                        payload,
+                        filtered,
+                        route_class=route_class,
+                    )
+                )
+
+            if isinstance(selected_subject, SelectedPlatformSubject):
+                provider_kind_value = OPENAI_PLATFORM_PROVIDER_KIND
+                (
+                    platform_sticky_key,
+                    platform_sticky_kind,
+                    platform_reallocate_sticky,
+                    platform_sticky_max_age_seconds,
+                ) = self._platform_affinity_for_selection(
+                    sticky_key=affinity.key,
+                    sticky_kind=affinity.kind,
+                    reallocate_sticky=affinity.reallocate_sticky,
+                    sticky_max_age_seconds=affinity.max_age_seconds,
+                )
+                current_identity = selected_subject.identity
+                excluded_identity_ids: set[str] = set()
+                safe_retry_budget = _COMPACT_SAME_CONTRACT_RETRY_BUDGET
+                transient_retries = 0
+                while True:
+                    routing_subject_id_value = current_identity.id
+                    try:
+                        platform_result = await _call_platform_compact(current_identity)
+                        upstream_request_id = platform_result.upstream_request_id
+                        response = platform_result.payload
+                        actual_service_tier = _service_tier_from_response(response)
+                        await self._settle_compact_api_key_usage(
+                            api_key=api_key,
+                            api_key_reservation=api_key_reservation,
+                            response=response,
+                            request_service_tier=request_service_tier,
+                        )
+                        log_status = "success"
+                        return response
+                    except OpenAIPlatformError as exc:
+                        upstream_request_id = exc.upstream_request_id
+                        await self._record_platform_auth_failure(current_identity.id, exc)
+                        if exc.status_code in {401, 403}:
+                            excluded_identity_ids.add(current_identity.id)
+                            replacement_identity = await self.select_platform_identity(
+                                route_family,
+                                sticky_key=platform_sticky_key,
+                                sticky_kind=platform_sticky_kind,
+                                reallocate_sticky=platform_reallocate_sticky,
+                                sticky_max_age_seconds=platform_sticky_max_age_seconds,
+                                exclude_routing_subject_ids=excluded_identity_ids,
+                            )
+                            if replacement_identity is not None:
+                                current_identity = replacement_identity
+                                safe_retry_budget = _COMPACT_SAME_CONTRACT_RETRY_BUDGET
+                                transient_retries = 0
+                                continue
+                        if exc.status_code == 500:
+                            transient_retries += 1
+                            if (
+                                transient_retries < _MAX_TRANSIENT_SAME_ACCOUNT_RETRIES
+                                and _remaining_budget_seconds(deadline) > 0
+                            ):
+                                delay = backoff_seconds(transient_retries)
+                                logger.info(
+                                    "Transient compact error, retrying same platform identity "
+                                    "request_id=%s routing_subject_id=%s retry=%s/%s delay=%.2fs",
+                                    request_id,
+                                    current_identity.id,
+                                    transient_retries,
+                                    _MAX_TRANSIENT_SAME_ACCOUNT_RETRIES,
+                                    delay,
+                                )
+                                await asyncio.sleep(delay)
+                                continue
+                        if exc.status_code in {502, 503, 504} and safe_retry_budget > 0:
+                            safe_retry_budget -= 1
+                            continue
+                        await self._settle_compact_api_key_usage(
+                            api_key=api_key,
+                            api_key_reservation=api_key_reservation,
+                            response=None,
+                            request_service_tier=request_service_tier,
+                        )
+                        raise ProxyResponseError(
+                            exc.status_code,
+                            exc.payload,
+                            upstream_request_id=exc.upstream_request_id,
+                            provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
+                            routing_subject_id=current_identity.id,
+                        ) from exc
 
             last_exc: ProxyResponseError | None = None
             excluded_account_ids: set[str] = set()
@@ -977,6 +1359,7 @@ class ProxyService:
                         openai_error(log_error_code, log_error_message),
                     )
                 account_id_value = account.id
+                routing_subject_id_value = account.id
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     logger.warning("Compact request budget exhausted before freshness check request_id=%s", request_id)
@@ -991,7 +1374,6 @@ class ProxyService:
                         exc_info=True,
                     )
                     _raise_proxy_unavailable(str(exc) or "Request to upstream timed out")
-                request_service_tier = _normalize_service_tier_value(payload.service_tier)
 
                 safe_retry_budget = _COMPACT_SAME_CONTRACT_RETRY_BUDGET
                 transient_retries = 0
@@ -999,7 +1381,9 @@ class ProxyService:
                 transient_exhausted = False
                 while True:
                     try:
-                        response = await _call_compact(account)
+                        provider_result = await _call_chatgpt_compact(account)
+                        upstream_request_id = provider_result.upstream_request_id
+                        response = provider_result.payload
                         actual_service_tier = _service_tier_from_response(response)
                         await self._load_balancer.record_success(account)
                         await self._settle_compact_api_key_usage(
@@ -1154,6 +1538,11 @@ class ProxyService:
                 502,
                 openai_error("upstream_unavailable", "All account attempts exhausted"),
             )
+        except NotImplementedError as exc:
+            log_error_code = "not_implemented"
+            log_error_message = str(exc) or "Requested compact provider is not implemented"
+            log_rejection_reason = "provider_compact_not_implemented"
+            raise
         except ProxyResponseError as exc:
             error = _parse_openai_error(exc.payload)
             log_error_code = log_error_code or _normalize_error_code(
@@ -1167,6 +1556,8 @@ class ProxyService:
             reasoning_effort = payload.reasoning.effort if payload.reasoning else None
             await self._write_request_log(
                 account_id=account_id_value,
+                provider_kind=provider_kind_value,
+                routing_subject_id=routing_subject_id_value,
                 api_key=api_key,
                 request_id=request_id,
                 model=payload.model,
@@ -1187,6 +1578,9 @@ class ProxyService:
                 service_tier=_effective_service_tier(request_service_tier, actual_service_tier),
                 requested_service_tier=request_service_tier,
                 actual_service_tier=actual_service_tier,
+                route_class=route_class,
+                upstream_request_id=upstream_request_id,
+                rejection_reason=log_rejection_reason,
             )
             _maybe_log_proxy_service_tier_trace(
                 "compact",

@@ -12,7 +12,6 @@ from app.modules.upstream_identities.repository import (
     OpenAIPlatformIdentityCreate,
     OpenAIPlatformIdentityUpdate,
     normalize_route_families,
-    split_route_families,
 )
 from app.modules.upstream_identities.schemas import (
     PlatformIdentityCreateRequest,
@@ -20,7 +19,10 @@ from app.modules.upstream_identities.schemas import (
     PlatformIdentityUpdateRequest,
     PlatformIdentityValidationResult,
 )
-from app.modules.upstream_identities.types import OPENAI_PLATFORM_PROVIDER_KIND
+from app.modules.upstream_identities.types import (
+    OPENAI_PLATFORM_PROVIDER_KIND,
+    PHASE1_PLATFORM_ROUTE_FAMILIES,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +62,7 @@ class OpenAIPlatformIdentitiesService:
     ) -> PlatformIdentityCreateResult:
         label = payload.label.strip()
         identity_id = generate_unique_account_id(label, label)
-        route_families = normalize_route_families(payload.eligible_route_families)
+        route_families = self._supported_route_families()
         identity = await self._repo.create_identity(
             OpenAIPlatformIdentityCreate(
                 id=identity_id,
@@ -86,11 +88,7 @@ class OpenAIPlatformIdentitiesService:
     ) -> PlatformIdentityUpdateResult:
         label = payload.label.strip() if payload.label is not None else identity.label
         api_key = payload.api_key if payload.api_key is not None else self.decrypt_api_key(identity)
-        route_families = normalize_route_families(
-            payload.eligible_route_families
-            if payload.eligible_route_families is not None
-            else self.route_families(identity)
-        )
+        route_families = self._supported_route_families()
         fields_set = payload.model_fields_set
         organization = payload.organization if "organization" in fields_set else identity.organization_id
         project = payload.project if "project" in fields_set else identity.project_id
@@ -165,10 +163,14 @@ class OpenAIPlatformIdentitiesService:
         return self._encryptor.decrypt(identity.api_key_encrypted)
 
     def route_families(self, identity: OpenAIPlatformIdentity) -> tuple[str, ...]:
-        return split_route_families(identity.eligible_route_families)
+        del identity
+        return self._supported_route_families()
 
     def summarize_identity(self, identity: OpenAIPlatformIdentity) -> PlatformIdentitySummary:
         return self._to_summary(identity)
+
+    def _supported_route_families(self) -> tuple[str, ...]:
+        return normalize_route_families(PHASE1_PLATFORM_ROUTE_FAMILIES)
 
     def _to_summary(self, identity: OpenAIPlatformIdentity) -> PlatformIdentitySummary:
         return PlatformIdentitySummary(

@@ -11,6 +11,7 @@ See `openspec/specs/sticky-session-operations/spec.md` for normative requirement
 - Sticky-session rows store an explicit `kind` so prompt-cache cleanup can target only bounded mappings.
 - Dashboard prompt-cache TTL is persisted in settings so operators can adjust it without restart.
 - Background cleanup removes stale prompt-cache rows proactively, while manual delete and purge endpoints provide operator override.
+- SQLite single-instance bridge deployments prefer a static local ring over unnecessary persisted heartbeat coordination.
 
 ## Constraints
 
@@ -20,4 +21,5 @@ See `openspec/specs/sticky-session-operations/spec.md` for normative requirement
 ## Failure Modes
 
 - Cleanup failures are logged and retried on the next interval; request handling continues.
+- SQLite local deployments should not surface repeated bridge-ring heartbeat lock noise once static-ring fallback is active.
 - Manual purge and delete operations are dashboard-auth protected and return normal dashboard API errors on invalid input or missing keys.

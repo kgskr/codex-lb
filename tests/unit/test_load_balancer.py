@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -15,8 +16,9 @@ from app.core.balancer import (
     select_account,
 )
 from app.core.usage.quota import apply_usage_quota
-from app.db.models import Account, AccountStatus, UsageHistory
+from app.db.models import Account, AccountStatus, StickySessionKind, UsageHistory
 from app.modules.proxy.load_balancer import LoadBalancer, RuntimeState, SelectionInputs, _state_from_account
+from app.modules.proxy.sticky_repository import StickyRoutingTarget
 
 pytestmark = pytest.mark.unit
 
@@ -432,6 +434,27 @@ def _make_test_usage(
     )
 
 
+class _DummyStickyRepository:
+    def __init__(self, target: StickyRoutingTarget | None = None) -> None:
+        self._target = target
+
+    async def get_target(
+        self,
+        key: str,
+        *,
+        kind,
+        provider_kind: str,
+        max_age_seconds: int | None = None,
+    ) -> StickyRoutingTarget | None:
+        del key, kind, provider_kind, max_age_seconds
+        return self._target
+
+
+@asynccontextmanager
+async def _sticky_repo_factory(target: StickyRoutingTarget | None):
+    yield SimpleNamespace(sticky_sessions=_DummyStickyRepository(target))
+
+
 @pytest.mark.asyncio
 async def test_should_fallback_to_platform_for_usage_drain_returns_false_when_one_chatgpt_account_is_healthy():
     balancer = LoadBalancer(lambda: None)
@@ -591,11 +614,11 @@ async def test_should_fallback_to_platform_for_usage_drain_returns_true_when_for
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED])
-async def test_should_fallback_to_platform_for_usage_drain_ignores_non_active_status_when_usage_is_healthy(
+async def test_should_fallback_to_platform_for_usage_drain_returns_true_when_only_non_active_candidates_remain(
     status: AccountStatus,
 ):
     balancer = LoadBalancer(lambda: None)
-    accounts = [_make_test_account("a", status=status)]
+    accounts = [_make_test_account("a", status=status, reset_at=int(time.time()) + 3600)]
     selection_inputs = SelectionInputs(
         accounts=accounts,
         latest_primary={"a": _make_test_usage("a", window="primary", used_percent=10.0)},
@@ -610,7 +633,188 @@ async def test_should_fallback_to_platform_for_usage_drain_ignores_non_active_st
 
     should_fallback = await balancer.should_fallback_to_platform_for_usage_drain(model="gpt-5.1")
 
-    assert should_fallback is False
+    assert should_fallback is True
+
+
+@pytest.mark.asyncio
+async def test_should_fallback_to_platform_for_usage_drain_returns_true_when_only_candidate_is_in_cooldown():
+    balancer = LoadBalancer(lambda: None)
+    accounts = [_make_test_account("a")]
+    selection_inputs = SelectionInputs(
+        accounts=accounts,
+        latest_primary={"a": _make_test_usage("a", window="primary", used_percent=10.0)},
+        latest_secondary={"a": _make_test_usage("a", window="secondary", used_percent=10.0)},
+        runtime_accounts=accounts,
+    )
+
+    async def fake_load_selection_inputs(*, model=None, additional_limit_name=None, account_ids=None):
+        del model, additional_limit_name, account_ids
+        return selection_inputs
+
+    balancer._load_selection_inputs = fake_load_selection_inputs  # type: ignore[method-assign]
+    balancer._runtime["a"] = RuntimeState(cooldown_until=time.time() + 60.0)
+
+    should_fallback = await balancer.should_fallback_to_platform_for_usage_drain(model="gpt-5.1")
+
+    assert should_fallback is True
+
+
+@pytest.mark.asyncio
+async def test_should_fallback_to_platform_for_usage_drain_returns_true_when_only_candidate_is_in_error_backoff():
+    balancer = LoadBalancer(lambda: None)
+    accounts = [_make_test_account("a")]
+    selection_inputs = SelectionInputs(
+        accounts=accounts,
+        latest_primary={"a": _make_test_usage("a", window="primary", used_percent=10.0)},
+        latest_secondary={"a": _make_test_usage("a", window="secondary", used_percent=10.0)},
+        runtime_accounts=accounts,
+    )
+
+    async def fake_load_selection_inputs(*, model=None, additional_limit_name=None, account_ids=None):
+        del model, additional_limit_name, account_ids
+        return selection_inputs
+
+    balancer._load_selection_inputs = fake_load_selection_inputs  # type: ignore[method-assign]
+    balancer._runtime["a"] = RuntimeState(error_count=4, last_error_at=time.time() - 1.0)
+
+    should_fallback = await balancer.should_fallback_to_platform_for_usage_drain(model="gpt-5.1")
+
+    assert should_fallback is True
+
+
+@pytest.mark.asyncio
+async def test_sticky_chatgpt_target_is_healthy_for_platform_fallback_respects_rate_limit_grace(monkeypatch):
+    now = int(time.time())
+    balancer = LoadBalancer(
+        lambda: _sticky_repo_factory(
+            StickyRoutingTarget(
+                provider_kind="chatgpt_web",
+                routing_subject_id="a",
+                account_id="a",
+            )
+        )
+    )
+    accounts = [_make_test_account("a", status=AccountStatus.RATE_LIMITED, reset_at=now + 5)]
+    selection_inputs = SelectionInputs(
+        accounts=accounts,
+        latest_primary={"a": _make_test_usage("a", window="primary", used_percent=10.0, reset_at=now + 5)},
+        latest_secondary={"a": _make_test_usage("a", window="secondary", used_percent=10.0, reset_at=now + 86400)},
+    )
+
+    async def fake_load_selection_inputs(*, model=None, additional_limit_name=None, account_ids=None):
+        del model, additional_limit_name, account_ids
+        return selection_inputs
+
+    balancer._load_selection_inputs = fake_load_selection_inputs  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings",
+        lambda: SimpleNamespace(
+            platform_fallback_force_enabled=False,
+            platform_fallback_primary_remaining_threshold_pct=10.0,
+            platform_fallback_secondary_remaining_threshold_pct=5.0,
+            prefer_earlier_reset_accounts=False,
+        ),
+    )
+
+    sticky_healthy = await balancer.sticky_chatgpt_target_is_healthy_for_platform_fallback(
+        sticky_key="session-1",
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        model="gpt-5.1",
+    )
+
+    assert sticky_healthy is True
+
+
+@pytest.mark.asyncio
+async def test_sticky_chatgpt_target_is_healthy_for_platform_fallback_returns_false_when_active_target_is_in_cooldown(
+    monkeypatch,
+):
+    balancer = LoadBalancer(
+        lambda: _sticky_repo_factory(
+            StickyRoutingTarget(
+                provider_kind="chatgpt_web",
+                routing_subject_id="a",
+                account_id="a",
+            )
+        )
+    )
+    accounts = [_make_test_account("a", status=AccountStatus.ACTIVE)]
+    selection_inputs = SelectionInputs(
+        accounts=accounts,
+        latest_primary={"a": _make_test_usage("a", window="primary", used_percent=10.0)},
+        latest_secondary={"a": _make_test_usage("a", window="secondary", used_percent=10.0)},
+        runtime_accounts=accounts,
+    )
+
+    async def fake_load_selection_inputs(*, model=None, additional_limit_name=None, account_ids=None):
+        del model, additional_limit_name, account_ids
+        return selection_inputs
+
+    balancer._load_selection_inputs = fake_load_selection_inputs  # type: ignore[method-assign]
+    balancer._runtime["a"] = RuntimeState(cooldown_until=time.time() + 60.0)
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings",
+        lambda: SimpleNamespace(
+            platform_fallback_force_enabled=False,
+            platform_fallback_primary_remaining_threshold_pct=10.0,
+            platform_fallback_secondary_remaining_threshold_pct=5.0,
+            prefer_earlier_reset_accounts=False,
+        ),
+    )
+
+    sticky_healthy = await balancer.sticky_chatgpt_target_is_healthy_for_platform_fallback(
+        sticky_key="session-1",
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        model="gpt-5.1",
+    )
+
+    assert sticky_healthy is False
+
+
+@pytest.mark.asyncio
+async def test_sticky_chatgpt_target_is_unhealthy_during_error_backoff(
+    monkeypatch,
+):
+    balancer = LoadBalancer(
+        lambda: _sticky_repo_factory(
+            StickyRoutingTarget(
+                provider_kind="chatgpt_web",
+                routing_subject_id="a",
+                account_id="a",
+            )
+        )
+    )
+    accounts = [_make_test_account("a", status=AccountStatus.ACTIVE)]
+    selection_inputs = SelectionInputs(
+        accounts=accounts,
+        latest_primary={"a": _make_test_usage("a", window="primary", used_percent=10.0)},
+        latest_secondary={"a": _make_test_usage("a", window="secondary", used_percent=10.0)},
+        runtime_accounts=accounts,
+    )
+
+    async def fake_load_selection_inputs(*, model=None, additional_limit_name=None, account_ids=None):
+        del model, additional_limit_name, account_ids
+        return selection_inputs
+
+    balancer._load_selection_inputs = fake_load_selection_inputs  # type: ignore[method-assign]
+    balancer._runtime["a"] = RuntimeState(error_count=4, last_error_at=time.time() - 1.0)
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings",
+        lambda: SimpleNamespace(
+            platform_fallback_force_enabled=False,
+            platform_fallback_primary_remaining_threshold_pct=10.0,
+            platform_fallback_secondary_remaining_threshold_pct=5.0,
+            prefer_earlier_reset_accounts=False,
+        ),
+    )
+
+    sticky_healthy = await balancer.sticky_chatgpt_target_is_healthy_for_platform_fallback(
+        sticky_key="session-1",
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        model="gpt-5.1",
+    )
+
+    assert sticky_healthy is False
 
 
 def _epoch_to_naive_utc(epoch: float) -> datetime:

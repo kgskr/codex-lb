@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from app.core.clients.openai_platform import OpenAIPlatformError, validate_platform_identity
+from app.core.clients.openai_platform import create_compact_response as create_platform_compact_response
 from app.core.clients.openai_platform import create_response as create_platform_response
 from app.core.clients.openai_platform import fetch_models as fetch_platform_models
 from app.core.clients.openai_platform import stream_responses as stream_platform_responses
@@ -166,6 +167,12 @@ class ProviderCreateResponseResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderCompactResponseResult:
+    payload: CompactResponsePayload
+    upstream_request_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderStreamResponseResult:
     event_stream: AsyncIterator[str]
     upstream_request_id: str | None
@@ -195,6 +202,13 @@ class ProviderAdapter(Protocol):
         subject: ProviderSubject,
         payload: Mapping[str, JsonValue],
     ) -> ProviderCreateResponseResult: ...
+
+    async def compact_response(
+        self,
+        subject: ProviderSubject,
+        payload: ResponsesCompactRequest,
+        headers: Mapping[str, str],
+    ) -> ProviderCompactResponseResult: ...
 
     async def stream_responses(
         self,
@@ -261,13 +275,16 @@ class ChatGPTWebProviderAdapter:
         subject: ProviderSubject,
         payload: ResponsesCompactRequest,
         headers: Mapping[str, str],
-    ) -> CompactResponsePayload:
+    ) -> ProviderCompactResponseResult:
         access_token, account_id = self._upstream_auth(subject)
         compact_impl = cast(
             _CompactResponsesCallable,
             _resolve_proxy_compat_callable("core_compact_responses", _DEFAULT_CORE_COMPACT_RESPONSES),
         )
-        return await compact_impl(payload, headers, access_token, account_id)
+        return ProviderCompactResponseResult(
+            payload=await compact_impl(payload, headers, access_token, account_id),
+            upstream_request_id=None,
+        )
 
     async def stream_response_events(
         self,
@@ -352,6 +369,7 @@ class OpenAIPlatformProviderAdapter:
         kind: str,
         method: str,
         subject: ProviderSubject,
+        route_class: str = OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
     ) -> float:
         started_at = time.monotonic()
         if not get_settings().log_upstream_request_summary:
@@ -366,7 +384,7 @@ class OpenAIPlatformProviderAdapter:
             method,
             self._base_url,
             self.provider_kind,
-            OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
+            route_class,
             subject.routing_subject_id,
             None,
             None,
@@ -384,6 +402,7 @@ class OpenAIPlatformProviderAdapter:
         error_code: str | None,
         error_message: str | None,
         upstream_request_id: str | None = None,
+        route_class: str = OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
     ) -> None:
         if not get_settings().log_upstream_request_summary:
             return
@@ -404,7 +423,7 @@ class OpenAIPlatformProviderAdapter:
             method,
             self._base_url,
             self.provider_kind,
-            OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
+            route_class,
             subject.routing_subject_id,
             None,
             status_code,
@@ -459,8 +478,18 @@ class OpenAIPlatformProviderAdapter:
             )
         return ProviderCapabilityDecision(allowed=True)
 
-    async def fetch_models(self, subject: ProviderSubject) -> ProviderModelsResult:
-        started_at = self._maybe_log_request_start(kind="platform_models", method="GET", subject=subject)
+    async def fetch_models(
+        self,
+        subject: ProviderSubject,
+        *,
+        route_class: str = OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
+    ) -> ProviderModelsResult:
+        started_at = self._maybe_log_request_start(
+            kind="platform_models",
+            method="GET",
+            subject=subject,
+            route_class=route_class,
+        )
         try:
             result = await fetch_platform_models(
                 base_url=self._base_url,
@@ -477,6 +506,8 @@ class OpenAIPlatformProviderAdapter:
                 status_code=exc.status_code,
                 error_code=_platform_error_code(exc.payload),
                 error_message=_platform_error_message(exc.payload),
+                upstream_request_id=exc.upstream_request_id,
+                route_class=route_class,
             )
             raise
         self._maybe_log_request_complete(
@@ -488,6 +519,7 @@ class OpenAIPlatformProviderAdapter:
             error_code=None,
             error_message=None,
             upstream_request_id=result.upstream_request_id,
+            route_class=route_class,
         )
         return ProviderModelsResult(payload=result.payload, upstream_request_id=result.upstream_request_id)
 
@@ -495,8 +527,15 @@ class OpenAIPlatformProviderAdapter:
         self,
         subject: ProviderSubject,
         payload: Mapping[str, JsonValue],
+        *,
+        route_class: str = OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
     ) -> ProviderCreateResponseResult:
-        started_at = self._maybe_log_request_start(kind="platform_responses", method="POST", subject=subject)
+        started_at = self._maybe_log_request_start(
+            kind="platform_responses",
+            method="POST",
+            subject=subject,
+            route_class=route_class,
+        )
         try:
             result = await create_platform_response(
                 base_url=self._base_url,
@@ -514,6 +553,8 @@ class OpenAIPlatformProviderAdapter:
                 status_code=exc.status_code,
                 error_code=_platform_error_code(exc.payload),
                 error_message=_platform_error_message(exc.payload),
+                upstream_request_id=exc.upstream_request_id,
+                route_class=route_class,
             )
             raise
         status = _platform_response_status(result.payload)
@@ -526,8 +567,64 @@ class OpenAIPlatformProviderAdapter:
             error_code=None if status != "failed" else _platform_response_error_code(result.payload),
             error_message=None if status != "failed" else _platform_response_error_message(result.payload),
             upstream_request_id=result.upstream_request_id,
+            route_class=route_class,
         )
         return ProviderCreateResponseResult(
+            payload=result.payload,
+            upstream_request_id=result.upstream_request_id,
+        )
+
+    async def compact_response(
+        self,
+        subject: ProviderSubject,
+        payload: ResponsesCompactRequest,
+        headers: Mapping[str, str],
+        *,
+        route_class: str = OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
+    ) -> ProviderCompactResponseResult:
+        del headers
+        started_at = self._maybe_log_request_start(
+            kind="platform_compact",
+            method="POST",
+            subject=subject,
+            route_class=route_class,
+        )
+        try:
+            result = await create_platform_compact_response(
+                base_url=self._base_url,
+                payload=payload.to_payload(),
+                api_key=self._encryptor.decrypt(subject.require_api_key_encrypted()),
+                organization=subject.organization_id,
+                project=subject.project_id,
+            )
+        except OpenAIPlatformError as exc:
+            self._maybe_log_request_complete(
+                kind="platform_compact",
+                method="POST",
+                subject=subject,
+                started_at=started_at,
+                status_code=exc.status_code,
+                error_code=_platform_error_code(exc.payload),
+                error_message=_platform_error_message(exc.payload),
+                upstream_request_id=exc.upstream_request_id,
+                route_class=route_class,
+            )
+            raise
+        status = result.payload.status
+        self._maybe_log_request_complete(
+            kind="platform_compact",
+            method="POST",
+            subject=subject,
+            started_at=started_at,
+            status_code=200,
+            error_code=None if status != "failed" else result.payload.error.code if result.payload.error else None,
+            error_message=(
+                None if status != "failed" else result.payload.error.message if result.payload.error else None
+            ),
+            upstream_request_id=result.upstream_request_id,
+            route_class=route_class,
+        )
+        return ProviderCompactResponseResult(
             payload=result.payload,
             upstream_request_id=result.upstream_request_id,
         )
@@ -536,8 +633,15 @@ class OpenAIPlatformProviderAdapter:
         self,
         subject: ProviderSubject,
         payload: Mapping[str, JsonValue],
+        *,
+        route_class: str = OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
     ) -> ProviderStreamResponseResult:
-        started_at = self._maybe_log_request_start(kind="platform_responses", method="POST", subject=subject)
+        started_at = self._maybe_log_request_start(
+            kind="platform_responses",
+            method="POST",
+            subject=subject,
+            route_class=route_class,
+        )
         try:
             result = await stream_platform_responses(
                 base_url=self._base_url,
@@ -555,6 +659,8 @@ class OpenAIPlatformProviderAdapter:
                 status_code=exc.status_code,
                 error_code=_platform_error_code(exc.payload),
                 error_message=_platform_error_message(exc.payload),
+                upstream_request_id=exc.upstream_request_id,
+                route_class=route_class,
             )
             raise
         self._maybe_log_request_complete(
@@ -566,6 +672,7 @@ class OpenAIPlatformProviderAdapter:
             error_code=None,
             error_message=None,
             upstream_request_id=result.upstream_request_id,
+            route_class=route_class,
         )
         return ProviderStreamResponseResult(
             event_stream=result.event_stream,
@@ -600,6 +707,7 @@ class OpenAIPlatformProviderAdapter:
                 status_code=exc.status_code,
                 error_code=_platform_error_code(exc.payload),
                 error_message=_platform_error_message(exc.payload),
+                upstream_request_id=exc.upstream_request_id,
             )
             raise
         self._maybe_log_request_complete(

@@ -1,11 +1,5 @@
 import type { AccountSummary } from "@/features/accounts/schemas";
-import {
-  formatCompactNumber,
-  formatCurrency,
-  formatProviderLabel,
-  formatRouteFamilyLabel,
-  formatTimeLong,
-} from "@/utils/formatters";
+import { formatCompactNumber, formatCurrency, formatProviderLabel, formatTimeLong } from "@/utils/formatters";
 
 function formatTimestamp(value: string | null | undefined): string {
   if (!value) {
@@ -42,22 +36,20 @@ export type PlatformIdentityPanelProps = {
 export function PlatformIdentityPanel({ account }: PlatformIdentityPanelProps) {
   const requestUsage = account.requestUsage ?? null;
   const hasRequestUsage = (requestUsage?.requestCount ?? 0) > 0;
-  const routeFamilies = account.eligibleRouteFamilies.length > 0
-    ? account.eligibleRouteFamilies.map((routeFamily) => {
-        if (routeFamily === "public_models_http") {
-          return `Fallback ${formatRouteFamilyLabel(routeFamily)}`;
-        }
-        if (routeFamily === "public_responses_http") {
-          return "Fallback stateless HTTP /v1/responses";
-        }
-        if (routeFamily === "backend_codex_http") {
-          return "Fallback HTTP /backend-api/codex/models + stateless HTTP /backend-api/codex/responses";
-        }
-        return formatRouteFamilyLabel(routeFamily);
-      }).join(", ")
-    : "None";
-  const responsesFallbackEnabled = account.eligibleRouteFamilies.includes("public_responses_http");
-  const backendCodexFallbackEnabled = account.eligibleRouteFamilies.includes("backend_codex_http");
+  const routeFamilies = account.eligibleRouteFamilies
+    .map((routeFamily) => {
+      switch (routeFamily) {
+        case "public_models_http":
+          return "Fallback HTTP /v1/models";
+        case "public_responses_http":
+          return "Fallback stateless HTTP /v1/responses + /v1/responses/compact";
+        case "backend_codex_http":
+          return "Fallback HTTP /backend-api/codex/models + stateless HTTP /backend-api/codex/responses + /backend-api/codex/responses/compact";
+        default:
+          return routeFamily;
+      }
+    })
+    .join(", ");
 
   return (
     <div className="space-y-4 rounded-lg border bg-muted/30 p-4">
@@ -80,22 +72,18 @@ export function PlatformIdentityPanel({ account }: PlatformIdentityPanelProps) {
           Fallback only. ChatGPT accounts stay primary, and this key is used only when the compatible ChatGPT pool is
           unhealthy under the configured primary or secondary usage drain thresholds.
         </p>
-        {responsesFallbackEnabled ? (
-          <p className="mt-1 text-xs text-muted-foreground">
-            Public Responses fallback covers stateless HTTP <code>/v1/responses</code> only.
-          </p>
-        ) : null}
-        {backendCodexFallbackEnabled ? (
-          <p className="mt-1 text-xs text-muted-foreground">
-            Codex HTTP fallback covers <code>/backend-api/codex/models</code> plus stateless HTTP{" "}
-            <code>/backend-api/codex/responses</code> only.
-          </p>
-        ) : null}
-        {responsesFallbackEnabled || backendCodexFallbackEnabled ? (
-          <p className="mt-1 text-xs text-muted-foreground">
-            Compact, websocket, and continuity-bound requests stay on ChatGPT.
-          </p>
-        ) : null}
+        <p className="mt-1 text-xs text-muted-foreground">
+          Public Responses fallback covers stateless HTTP <code>/v1/responses</code> and{" "}
+          <code>/v1/responses/compact</code>.
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Codex HTTP fallback covers <code>/backend-api/codex/models</code>, stateless HTTP{" "}
+          <code>/backend-api/codex/responses</code>, and stateless HTTP{" "}
+          <code>/backend-api/codex/responses/compact</code>.
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Websocket and continuity-bound requests stay on ChatGPT.
+        </p>
       </div>
 
       <div className="rounded-md border bg-background/60 px-3 py-2">

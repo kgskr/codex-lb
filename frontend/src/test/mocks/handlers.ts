@@ -33,6 +33,11 @@ import {
 
 const MODEL_OPTION_DELIMITER = ":::";
 const STATUS_ORDER = ["ok", "rate_limit", "quota", "error"] as const;
+const PLATFORM_ELIGIBLE_ROUTE_FAMILIES = [
+	"backend_codex_http",
+	"public_models_http",
+	"public_responses_http",
+] as const;
 
 // ── Zod schemas for mock request bodies ──
 
@@ -392,7 +397,7 @@ export const handlers = [
 			status: "active",
 			organization: payload.organization ?? null,
 			project: payload.project ?? null,
-			eligibleRouteFamilies: payload.eligibleRouteFamilies,
+			eligibleRouteFamilies: [...PLATFORM_ELIGIBLE_ROUTE_FAMILIES],
 			lastValidatedAt: new Date().toISOString(),
 			lastAuthFailureReason: null,
 			usage: null,
@@ -438,9 +443,6 @@ export const handlers = [
 		}
 		if ("project" in payload) {
 			account.project = payload.project ?? null;
-		}
-		if (payload.eligibleRouteFamilies !== undefined) {
-			account.eligibleRouteFamilies = payload.eligibleRouteFamilies;
 		}
 		if (
 			payload.apiKey !== undefined ||
