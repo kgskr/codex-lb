@@ -85,6 +85,8 @@ The system SHALL enforce session authentication on `/api/*` routes except `/api/
 
 Authentication required condition: the system SHALL evaluate `password_hash` and `totp_required_on_login` together to determine whether authentication is required. When `password_hash` is NULL **and** `totp_required_on_login` is false, the guard MUST allow all requests (unauthenticated mode). When either `password_hash` is set **or** `totp_required_on_login` is true, the guard MUST require a valid session.
 
+When `insecure_allow_remote_no_auth=true` and the request is positively identified as originating from the host OS network, the guard MAY bypass session enforcement for non-`/api/dashboard-auth/*` routes only while dashboard auth is otherwise disabled. Host-header spoofing alone MUST NOT qualify a request for this bypass.
+
 Session validation steps when `requires_auth` is true:
 1. A valid session cookie MUST be present (otherwise 401)
 2. If `password_hash` is not NULL, the session MUST have `password_verified=true`
@@ -134,6 +136,27 @@ The guard SHALL raise a domain exception on authentication failure. The exceptio
 - **AND** session has `password_verified=true` but `totp_verified=false`
 - **THEN** the guard returns 401 with `totp_required` indication
 
+#### Scenario: Host-OS request bypasses dashboard guard when auth is disabled
+
+- **WHEN** `password_hash` is NULL and `totp_required_on_login` is false
+- **AND** `insecure_allow_remote_no_auth=true`
+- **AND** the request is classified as a host-OS request
+- **THEN** non-`/api/dashboard-auth/*` dashboard routes bypass session auth
+
+#### Scenario: Spoofed localhost host header does not bypass dashboard guard
+
+- **WHEN** `insecure_allow_remote_no_auth=true`
+- **AND** a remote public client sends `Host: localhost`
+- **AND** the request does not otherwise prove host-network origin
+- **THEN** the dashboard guard does not bypass authentication or remote bootstrap checks
+
+#### Scenario: Host-OS bypass stops once password or TOTP auth is required
+
+- **WHEN** `insecure_allow_remote_no_auth=true`
+- **AND** the request is classified as a host-OS request
+- **AND** `password_hash` is set or `totp_required_on_login` is true
+- **THEN** the dashboard guard requires a valid session
+
 ### Requirement: Session state endpoint
 
 The system SHALL expose `GET /api/dashboard-auth/session` returning the current authentication state including `password_required` (whether a password is configured), `authenticated` (whether the session is fully valid), `totp_required_on_login`, `totp_configured`, and bootstrap flags used for first-run remote setup.
@@ -157,6 +180,14 @@ The system SHALL expose `GET /api/dashboard-auth/session` returning the current 
 
 - **WHEN** `password_hash` is NULL, `totp_required_on_login` is false, and the session request comes from a non-local client
 - **THEN** the response contains `{ "passwordRequired": false, "authenticated": false, "bootstrapRequired": true }`
+
+#### Scenario: Host-OS request reports authenticated bootstrap-free state
+
+- **WHEN** `password_hash` is NULL and `totp_required_on_login` is false
+- **AND** `insecure_allow_remote_no_auth=true`
+- **AND** the request is classified as a host-OS request
+- **THEN** the response reports `authenticated: true`
+- **AND** it reports `bootstrapRequired: false`
 
 ### Requirement: TOTP setup requires password session
 

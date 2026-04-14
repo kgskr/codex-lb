@@ -219,3 +219,48 @@ async def test_fetch_image_data_url_uses_fallback_ip_when_first_fails(monkeypatc
     assert len(session.calls) == 2
     assert session.calls[0]["url"] == "https://[2001:db8::1]/a.png"
     assert session.calls[1]["url"] == "https://93.184.216.34/a.png"
+
+
+@pytest.mark.asyncio
+async def test_resolve_safe_image_fetch_target_clamps_dns_timeout_to_remaining_deadline(monkeypatch):
+    captured: dict[str, float] = {}
+
+    async def resolve_ips(host: str, *, timeout_seconds: float):
+        del host
+        captured["timeout_seconds"] = timeout_seconds
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(proxy_module, "_resolve_global_ips", resolve_ips)
+    monkeypatch.setattr(proxy_module.time, "monotonic", lambda: 100.0)
+
+    target = await proxy_module._resolve_safe_image_fetch_target(
+        "https://example.com/a.png",
+        connect_timeout=5.0,
+        deadline=100.25,
+    )
+
+    assert target is not None
+    assert captured["timeout_seconds"] == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_resolve_safe_image_fetch_target_returns_none_when_deadline_has_elapsed(monkeypatch):
+    called = False
+
+    async def resolve_ips(host: str, *, timeout_seconds: float):
+        nonlocal called
+        del host, timeout_seconds
+        called = True
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(proxy_module, "_resolve_global_ips", resolve_ips)
+    monkeypatch.setattr(proxy_module.time, "monotonic", lambda: 100.0)
+
+    target = await proxy_module._resolve_safe_image_fetch_target(
+        "https://example.com/a.png",
+        connect_timeout=5.0,
+        deadline=100.0,
+    )
+
+    assert target is None
+    assert called is False

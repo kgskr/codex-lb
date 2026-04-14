@@ -1249,7 +1249,8 @@ async def test_stream_responses_starts_upstream_timer_after_image_inlining(monke
     inline_ran = False
     recorded: dict[str, float | None] = {}
 
-    async def fake_inline(payload_dict, session, connect_timeout):
+    async def fake_inline(payload_dict, session, connect_timeout, *, deadline=None):
+        del deadline
         nonlocal inline_ran
         inline_ran = True
         return payload_dict
@@ -3106,7 +3107,8 @@ async def test_compact_responses_starts_upstream_timer_after_image_inlining(monk
     inline_ran = False
     recorded: dict[str, float | None] = {}
 
-    async def fake_inline(payload_dict, session, connect_timeout):
+    async def fake_inline(payload_dict, session, connect_timeout, *, deadline=None):
+        del deadline
         nonlocal inline_ran
         inline_ran = True
         return payload_dict

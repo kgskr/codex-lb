@@ -107,7 +107,6 @@ export const PlatformIdentityCreateRequestSchema = z.object({
   apiKey: z.string().trim().min(1, "API key is required"),
   organization: OptionalTrimmedStringSchema,
   project: OptionalTrimmedStringSchema,
-  eligibleRouteFamilies: z.array(PlatformRouteFamilySchema).default([]),
 });
 
 const OptionalNullableTrimmedStringSchema = z
@@ -129,7 +128,6 @@ export const PlatformIdentityUpdateRequestSchema = z.object({
   apiKey: z.string().trim().min(1, "API key is required").optional(),
   organization: OptionalNullableTrimmedStringSchema,
   project: OptionalNullableTrimmedStringSchema,
-  eligibleRouteFamilies: z.array(PlatformRouteFamilySchema).optional(),
 });
 
 export const AccountActionResponseSchema = z.object({

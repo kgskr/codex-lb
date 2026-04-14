@@ -230,10 +230,38 @@ async def v1_responses(
         responses_payload = payload.to_responses_request()
     except ClientPayloadError as exc:
         error = openai_invalid_payload_error(exc.param)
-        return _logged_error_json_response(request, 400, error)
+        await _persist_proxy_error_log_from_content(
+            context=context,
+            api_key=api_key,
+            model=payload.model,
+            route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
+            rejection_reason="invalid_responses_payload",
+            content=error,
+        )
+        return _logged_error_json_response(
+            request,
+            400,
+            error,
+            route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
+            rejection_reason="invalid_responses_payload",
+        )
     except ValidationError as exc:
         error = openai_validation_error(exc)
-        return _logged_error_json_response(request, 400, error)
+        await _persist_proxy_error_log_from_content(
+            context=context,
+            api_key=api_key,
+            model=payload.model,
+            route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
+            rejection_reason="invalid_responses_payload",
+            content=error,
+        )
+        return _logged_error_json_response(
+            request,
+            400,
+            error,
+            route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
+            rejection_reason="invalid_responses_payload",
+        )
     platform_response = await _maybe_handle_platform_v1_responses(
         request=request,
         payload=responses_payload,
@@ -985,35 +1013,15 @@ async def responses_compact(
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> JSONResponse:
-    effective_model = _effective_model_for_api_key(api_key, payload.model)
-    if await _should_reject_platform_only_route(
-        context=context,
-        api_key=api_key,
-        route_family=BACKEND_CODEX_HTTP_ROUTE_FAMILY,
-        model=effective_model,
-    ):
-        error = _provider_error(
-            "provider_feature_unsupported",
-            "OpenAI Platform identities do not support /backend-api/codex/responses/compact in this increment.",
-        )
-        await context.service.write_provider_rejection_log(
-            api_key=api_key,
-            request_id=ensure_request_id(),
-            model=effective_model,
-            error_code="provider_feature_unsupported",
-            error_message=error["error"]["message"],
-            route_class=CHATGPT_PRIVATE_ROUTE_CLASS,
-            rejection_reason="backend_codex_compact_platform_unsupported",
-        )
-        return _logged_error_json_response(
-            request,
-            400,
-            error,
-            route_class=CHATGPT_PRIVATE_ROUTE_CLASS,
-            rejection_reason="backend_codex_compact_platform_unsupported",
-        )
     return await _compact_responses(
-        request, payload, context, api_key, codex_session_affinity=True, openai_cache_affinity=True
+        request,
+        payload,
+        context,
+        api_key,
+        codex_session_affinity=True,
+        openai_cache_affinity=True,
+        route_family=BACKEND_CODEX_HTTP_ROUTE_FAMILY,
+        route_class=CHATGPT_PRIVATE_ROUTE_CLASS,
     )
 
 
@@ -1028,37 +1036,38 @@ async def v1_responses_compact(
         compact_payload = payload.to_compact_request()
     except ClientPayloadError as exc:
         error = openai_invalid_payload_error(exc.param)
+        await _persist_proxy_error_log_from_content(
+            context=context,
+            api_key=api_key,
+            model=payload.model,
+            route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
+            rejection_reason="invalid_compact_payload",
+            content=error,
+        )
         return _logged_error_json_response(
             request,
             400,
             error,
             route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
-            rejection_reason="compact_platform_unsupported",
+            rejection_reason="invalid_compact_payload",
         )
     except ValidationError as exc:
         error = openai_validation_error(exc)
-        return _logged_error_json_response(request, 400, error)
-    effective_model = _effective_model_for_api_key(api_key, compact_payload.model)
-    if await _should_reject_platform_only_route(
-        context=context,
-        api_key=api_key,
-        route_family=PUBLIC_RESPONSES_HTTP_ROUTE_FAMILY,
-        model=effective_model,
-    ):
-        error = _provider_error(
-            "provider_feature_unsupported",
-            "OpenAI Platform identities do not support /v1/responses/compact in phase 1.",
-        )
-        await context.service.write_provider_rejection_log(
+        await _persist_proxy_error_log_from_content(
+            context=context,
             api_key=api_key,
-            request_id=ensure_request_id(),
-            model=effective_model,
-            error_code="provider_feature_unsupported",
-            error_message=error["error"]["message"],
+            model=payload.model,
             route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
-            rejection_reason="compact_platform_unsupported",
+            rejection_reason="invalid_compact_payload",
+            content=error,
         )
-        return _logged_error_json_response(request, 400, error)
+        return _logged_error_json_response(
+            request,
+            400,
+            error,
+            route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
+            rejection_reason="invalid_compact_payload",
+        )
     return await _compact_responses(
         request,
         compact_payload,
@@ -1066,6 +1075,8 @@ async def v1_responses_compact(
         api_key,
         codex_session_affinity=False,
         openai_cache_affinity=True,
+        route_family=PUBLIC_RESPONSES_HTTP_ROUTE_FAMILY,
+        route_class=OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
     )
 
 
@@ -1076,9 +1087,40 @@ async def _compact_responses(
     api_key: ApiKeyData | None,
     codex_session_affinity: bool = False,
     openai_cache_affinity: bool = False,
+    route_family: str = BACKEND_CODEX_HTTP_ROUTE_FAMILY,
+    route_class: str = CHATGPT_PRIVATE_ROUTE_CLASS,
 ) -> JSONResponse:
     apply_api_key_enforcement(payload, api_key)
     validate_model_access(api_key, payload.model)
+    effective_model = _effective_model_for_api_key(api_key, payload.model)
+    affinity = await _selection_affinity_for_compact_request(
+        payload,
+        request.headers,
+        codex_session_affinity=codex_session_affinity,
+        openai_cache_affinity=openai_cache_affinity,
+        api_key=api_key,
+    )
+    selection = await context.service.select_routing_subject(
+        capabilities=_derive_request_capabilities(
+            route_family=route_family,
+            route_class=route_class,
+            transport="http",
+            model=effective_model,
+        ),
+        api_key=api_key,
+        sticky_key=affinity.key,
+        sticky_kind=affinity.kind,
+        reallocate_sticky=affinity.reallocate_sticky,
+        sticky_max_age_seconds=affinity.max_age_seconds,
+    )
+    if selection.failure is not None:
+        return await _provider_selection_failure_response(
+            request=request,
+            context=context,
+            api_key=api_key,
+            model=effective_model,
+            failure=selection.failure,
+        )
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
@@ -1094,6 +1136,9 @@ async def _compact_responses(
             openai_cache_affinity=openai_cache_affinity,
             api_key=api_key,
             api_key_reservation=reservation,
+            selected_subject=selection.selected,
+            route_family=route_family,
+            route_class=route_class,
         )
     except NotImplementedError:
         error = OpenAIErrorEnvelopeModel(
@@ -1103,19 +1148,31 @@ async def _compact_responses(
                 code="not_implemented",
             )
         )
+        selected_fields = _selected_subject_log_fields(selection.selected)
         return _logged_error_json_response(
             request,
             501,
             error.model_dump(mode="json", exclude_none=True),
             headers=rate_limit_headers,
+            route_class=route_class,
+            rejection_reason="provider_compact_not_implemented",
+            **selected_fields,
         )
     except ProxyResponseError as exc:
         error = _parse_error_envelope(exc.payload)
+        selected_fields = _selected_subject_log_fields(selection.selected)
+        if getattr(exc, "provider_kind", None) is not None:
+            selected_fields["provider_kind"] = exc.provider_kind
+        if getattr(exc, "routing_subject_id", None) is not None:
+            selected_fields["routing_subject_id"] = exc.routing_subject_id
         return _logged_error_json_response(
             request,
             exc.status_code,
             error.model_dump(mode="json", exclude_none=True),
             headers=rate_limit_headers,
+            route_class=route_class,
+            upstream_request_id=getattr(exc, "upstream_request_id", None),
+            **selected_fields,
         )
     finally:
         await _release_reservation(reservation)
@@ -1201,6 +1258,88 @@ def _derive_request_capabilities(
         transport=transport,
         model=model,
         continuity_param=continuity_param,
+    )
+
+
+async def _selection_affinity_for_compact_request(
+    payload: ResponsesCompactRequest,
+    headers: Mapping[str, str],
+    *,
+    codex_session_affinity: bool,
+    openai_cache_affinity: bool,
+    api_key: ApiKeyData | None,
+):
+    settings = await proxy_service_module.get_settings_cache().get()
+    return proxy_service_module._sticky_key_for_compact_request(
+        payload,
+        headers,
+        codex_session_affinity=codex_session_affinity,
+        openai_cache_affinity=openai_cache_affinity,
+        openai_cache_affinity_max_age_seconds=settings.openai_cache_affinity_max_age_seconds,
+        sticky_threads_enabled=settings.sticky_threads_enabled,
+        api_key=api_key,
+    )
+
+
+async def _selection_affinity_for_responses_request(
+    payload: ResponsesRequest,
+    headers: Mapping[str, str],
+    *,
+    codex_session_affinity: bool,
+    openai_cache_affinity: bool,
+    api_key: ApiKeyData | None,
+):
+    settings = await proxy_service_module.get_settings_cache().get()
+    return proxy_service_module._sticky_key_for_responses_request(
+        payload,
+        headers,
+        codex_session_affinity=codex_session_affinity,
+        openai_cache_affinity=openai_cache_affinity,
+        openai_cache_affinity_max_age_seconds=settings.openai_cache_affinity_max_age_seconds,
+        sticky_threads_enabled=settings.sticky_threads_enabled,
+        api_key=api_key,
+    )
+
+
+def _selected_subject_log_fields(
+    selected: proxy_service_module.SelectedChatGPTSubject | proxy_service_module.SelectedPlatformSubject | None,
+) -> dict[str, str | None]:
+    if selected is None:
+        return {
+            "provider_kind": None,
+            "routing_subject_id": None,
+        }
+    return {
+        "provider_kind": selected.provider_kind,
+        "routing_subject_id": selected.routing_subject_id,
+    }
+
+
+async def _persist_proxy_error_log_from_content(
+    *,
+    context: ProxyContext,
+    api_key: ApiKeyData | None,
+    model: str | None,
+    route_class: str | None,
+    rejection_reason: str | None,
+    content: Mapping[str, JsonValue] | OpenAIErrorEnvelopeModel | OpenAIErrorEnvelope,
+    provider_kind: str | None = None,
+    routing_subject_id: str | None = None,
+    upstream_request_id: str | None = None,
+) -> None:
+    error_code, error_message = _error_details_from_content(content)
+    await context.service.write_proxy_error_log(
+        account_id=None,
+        provider_kind=provider_kind,
+        routing_subject_id=routing_subject_id,
+        api_key=api_key,
+        request_id=ensure_request_id(),
+        model=model,
+        error_code=error_code or "server_error",
+        error_message=error_message or "Proxy request failed",
+        route_class=route_class,
+        rejection_reason=rejection_reason,
+        upstream_request_id=upstream_request_id,
     )
 
 
@@ -1307,7 +1446,16 @@ async def _maybe_build_platform_models_response(
         )
     except OpenAIPlatformError as exc:
         await _release_reservation(reservation)
-        return JSONResponse(status_code=exc.status_code, content=exc.payload)
+        return _logged_error_json_response(
+            request,
+            exc.status_code,
+            exc.payload,
+            provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
+            routing_subject_id=selected.identity.id,
+            route_class=route_class,
+            rejection_reason="platform_models_request_failed",
+            upstream_request_id=exc.upstream_request_id,
+        )
     await _release_reservation(reservation)
     if response is None:
         return None
@@ -1328,6 +1476,13 @@ async def _maybe_handle_platform_responses(
     route_class: str,
 ) -> Response | None:
     effective_model = _effective_model_for_api_key(api_key, payload.model)
+    affinity = await _selection_affinity_for_responses_request(
+        payload,
+        request.headers,
+        codex_session_affinity=route_family == BACKEND_CODEX_HTTP_ROUTE_FAMILY,
+        openai_cache_affinity=True,
+        api_key=api_key,
+    )
     selection = await context.service.select_routing_subject(
         capabilities=_derive_request_capabilities(
             route_family=route_family,
@@ -1338,6 +1493,10 @@ async def _maybe_handle_platform_responses(
             headers=request.headers,
         ),
         api_key=api_key,
+        sticky_key=affinity.key,
+        sticky_kind=affinity.kind,
+        reallocate_sticky=affinity.reallocate_sticky,
+        sticky_max_age_seconds=affinity.max_age_seconds,
     )
     if selection.failure is not None:
         return await _provider_selection_failure_response(
@@ -1364,12 +1523,15 @@ async def _maybe_handle_platform_responses(
     request_id = ensure_request_id()
     start = time.monotonic()
     if payload.stream:
+        identity = None
+        upstream_response = None
         try:
             identity, upstream_response = await context.service.stream_platform_response_events(
                 payload=payload,
                 api_key=api_key,
                 identity=selected.identity,
                 route_family=route_family,
+                route_class=route_class,
             )
             if identity is None or upstream_response is None:
                 await _release_reservation(reservation)
@@ -1377,7 +1539,35 @@ async def _maybe_handle_platform_responses(
             first = await upstream_response.event_stream.__anext__()
         except StopAsyncIteration:
             await _release_reservation(reservation)
-            return StreamingResponse(iter(()), media_type="text/event-stream", headers=rate_limit_headers)
+            await context.service.write_proxy_error_log(
+                account_id=None,
+                provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
+                routing_subject_id=selected.identity.id,
+                api_key=api_key,
+                request_id=request_id,
+                model=payload.model,
+                error_code="upstream_unavailable",
+                error_message="Failed to receive the initial OpenAI Platform streaming response.",
+                route_class=route_class,
+                rejection_reason="platform_stream_start_failed",
+                upstream_request_id=(upstream_response.upstream_request_id if upstream_response is not None else None),
+                transport="http",
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
+            return _logged_error_json_response(
+                request,
+                502,
+                openai_error(
+                    "upstream_unavailable",
+                    "Failed to receive the initial OpenAI Platform streaming response.",
+                ),
+                headers=rate_limit_headers,
+                provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
+                routing_subject_id=selected.identity.id,
+                route_class=route_class,
+                rejection_reason="platform_stream_start_failed",
+                upstream_request_id=(upstream_response.upstream_request_id if upstream_response is not None else None),
+            )
         except OpenAIPlatformError as exc:
             await _release_reservation(reservation)
             return _logged_error_json_response(
@@ -1385,6 +1575,11 @@ async def _maybe_handle_platform_responses(
                 exc.status_code,
                 exc.payload,
                 headers=rate_limit_headers,
+                provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
+                routing_subject_id=selected.identity.id,
+                route_class=route_class,
+                rejection_reason="platform_stream_request_failed",
+                upstream_request_id=exc.upstream_request_id,
             )
         except Exception as exc:
             await _release_reservation(reservation)
@@ -1449,6 +1644,7 @@ async def _maybe_handle_platform_responses(
             api_key=api_key,
             identity=selected.identity,
             route_family=route_family,
+            route_class=route_class,
         )
     except OpenAIPlatformError as exc:
         await _release_reservation(reservation)
@@ -1457,6 +1653,11 @@ async def _maybe_handle_platform_responses(
             exc.status_code,
             exc.payload,
             headers=rate_limit_headers,
+            provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
+            routing_subject_id=selected.identity.id,
+            route_class=route_class,
+            rejection_reason="platform_response_request_failed",
+            upstream_request_id=exc.upstream_request_id,
         )
 
     await _release_reservation(reservation)

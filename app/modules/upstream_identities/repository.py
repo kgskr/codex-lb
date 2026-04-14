@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AccountStatus, OpenAIPlatformIdentity
-from app.modules.upstream_identities.types import PlatformRouteFamily
+from app.modules.upstream_identities.types import PHASE1_PLATFORM_ROUTE_FAMILIES, PlatformRouteFamily
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,12 +59,13 @@ class OpenAIPlatformIdentitiesRepository:
         self,
         route_family: PlatformRouteFamily,
     ) -> list[OpenAIPlatformIdentity]:
+        if route_family not in PHASE1_PLATFORM_ROUTE_FAMILIES:
+            return []
         identities = await self.list_identities()
         return [
             identity
             for identity in identities
             if identity.status not in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED)
-            and route_family in _split_route_families(identity.eligible_route_families)
         ]
 
     async def create_identity(self, create: OpenAIPlatformIdentityCreate) -> OpenAIPlatformIdentity:

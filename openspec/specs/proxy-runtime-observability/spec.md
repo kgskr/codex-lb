@@ -52,6 +52,12 @@ Persisted request logs MUST no longer be account-only records. For provider-awar
 - **WHEN** the proxy rejects a request before upstream selection because no provider supports the requested route, transport, or continuity capability
 - **THEN** the persisted request log still records the requested route class and normalized rejection reason without requiring an `account_id`
 
+#### Scenario: Reservation cleanup failure does not override the proxy result
+- **WHEN** request handling has already produced a client response
+- **AND** best-effort API-key reservation cleanup fails during post-response teardown
+- **THEN** the proxy preserves the original response outcome
+- **AND** it logs the cleanup failure without replacing the original response with a cleanup error
+
 ### Requirement: Proxy 4xx/5xx responses are logged with provider-aware rejection detail
 When the proxy returns a 4xx or 5xx response for a proxied request, the system MUST log the request id, method, path, status code, error code, and error message to the console. When the failure is caused by provider capability gating before routing-subject selection, the log MUST also include the requested route class and rejection reason.
 
@@ -67,8 +73,8 @@ When the proxy returns a 4xx or 5xx response for a proxied request, the system M
 - **WHEN** the proxy rejects a request before upstream selection because no provider supports the requested route, transport, or continuity capability
 - **THEN** the console log includes the requested route class and normalized rejection code
 
-### Requirement: Provider health transitions are logged with provider context
-When provider health changes because of validation or repeated upstream auth failures, the system MUST log the provider kind, routing-subject identifier, and normalized failure reason.
+### Requirement: Provider auth failure transitions are logged with provider context
+When provider health changes because of upstream auth failures, the system MUST log the provider kind, routing-subject identifier, and normalized failure reason.
 
 #### Scenario: Platform auth failure changes provider health
 - **WHEN** an `openai_platform` identity transitions to unhealthy or deactivated after repeated auth failures

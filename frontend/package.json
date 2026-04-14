@@ -7,8 +7,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "test": "vitest run",
-    "test:coverage": "vitest run --coverage",
+    "test": "node ./node_modules/vitest/vitest.mjs run",
+    "test:coverage": "node ./node_modules/vitest/vitest.mjs run --coverage",
     "lint": "eslint .",
     "typecheck": "tsc -b",
     "preview": "vite preview",

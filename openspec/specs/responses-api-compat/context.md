@@ -2,7 +2,7 @@
 
 ## Purpose and Scope
 
-This capability implements OpenAI-compatible behavior for `POST /v1/responses`, including request validation, streaming events, non-streaming aggregation, and OpenAI-style error envelopes. The scope is limited to what the ChatGPT upstream can provide; unsupported features are explicitly rejected.
+This capability implements OpenAI-compatible behavior for `POST /v1/responses`, including request validation, streaming events, non-streaming aggregation, and OpenAI-style error envelopes. The scope is limited to what the selected upstream provider contract can safely preserve in phase 1; unsupported features are explicitly rejected.
 
 See `openspec/specs/responses-api-compat/spec.md` for normative requirements.
 
@@ -25,7 +25,7 @@ See `openspec/specs/responses-api-compat/spec.md` for normative requirements.
 - When operators configure a multi-instance bridge ring, deterministic owner enforcement now applies only to hard continuity keys such as `x-codex-turn-state` and explicit session headers. Prompt-cache-derived bridge keys remain stable for local reuse, but in gateway-safe mode a non-owner replica may tolerate that locality miss and create or reuse a local session instead of failing with `bridge_instance_mismatch`.
 - Codex-facing websocket routes now advertise `x-codex-turn-state` during websocket accept and honor client-provided turn-state on reconnect so routing can stay sticky at turn granularity even when the public websocket reconnects.
 - HTTP responses routes now also return `x-codex-turn-state` headers so clients that persist response headers can promote later HTTP requests from prompt-cache affinity to stronger Codex-session continuity.
-- `/v1/responses/compact` keeps a final-JSON contract and preserves the raw upstream `/codex/responses/compact` payload shape as the canonical next context window instead of rewriting it through buffered `/codex/responses` streaming.
+- `/v1/responses/compact` and `/backend-api/codex/responses/compact` keep a final-JSON contract and preserve the selected provider's native compact payload shape as the canonical next context window instead of rewriting it through buffered `/responses` streaming. ChatGPT uses direct `/codex/responses/compact`; Platform fallback uses direct `/v1/responses/compact`.
 - Compact transport failures fail closed with respect to semantics: no surrogate `/codex/responses` fallback and no local compact-window reconstruction.
 - Compact transport may use bounded same-contract retries only for safe pre-body transport failures and `401 -> refresh -> retry`.
 - `/v1/responses/compact` is supported only when the upstream implements it.
@@ -45,7 +45,7 @@ See `openspec/specs/responses-api-compat/spec.md` for normative requirements.
 
 - **Stream ends without terminal event:** Emit `response.failed` with `stream_incomplete`.
 - **Upstream error / no accounts:** Non-streaming responses return an OpenAI error envelope with 5xx status.
-- **Compact upstream transport/client failure:** Retry only inside `/codex/responses/compact` when the failure is safely retryable; otherwise return an explicit upstream error without surrogate fallback.
+- **Compact upstream transport/client failure:** Retry only inside the selected provider-native compact endpoint when the failure is safely retryable; otherwise return an explicit upstream error without surrogate fallback.
 - **HTTP bridge session closes or expires:** The next compatible HTTP `/v1/responses` or `/backend-api/codex/responses` request recreates a fresh upstream websocket bridge session; continuity is guaranteed only within the lifetime of one active bridged session.
 - **Multi-instance routing without bridge owner policy:** if operators do not configure a bridge ring or front-door affinity, continuity can still fragment across replicas. With a configured bridge ring, hard continuity keys still fail closed on the wrong replica, while gateway-safe prompt-cache requests may accept locality misses instead of failing.
 - **Codex websocket reconnects:** Reconnect continuity now depends on the client replaying the accepted `x-codex-turn-state`; generated turn-state is emitted on accept for backend Codex routes and echoed back when the client already supplies one.
@@ -81,6 +81,6 @@ Non-streaming request/response:
 - Post-deploy: monitor `no_accounts`, `upstream_unavailable`, compact retry attempts, and compact failure phases, especially on direct compact requests.
 - Post-deploy: monitor HTTP bridge reuse/create/evict/reconnect counts and any `previous_response_not_found` or queue-saturation errors on `/v1/responses` and `/backend-api/codex/responses`.
 - Post-deploy: monitor `capacity_exhausted_active_sessions`, Codex-session bridge reuse/evict counts, websocket handshake 403/404 rates after the narrower auto-fallback policy, and backend Codex HTTP vs websocket cache-ratio gaps.
-- When tracing compact incidents, confirm that request logs and upstream logs show direct `/codex/responses/compact` usage without surrogate `/codex/responses` fallback.
+- When tracing compact incidents, confirm that request logs and upstream logs show direct provider-native compact usage without surrogate `/responses` fallback: `/codex/responses/compact` for ChatGPT and `/v1/responses/compact` for Platform fallback.
 - Post-deploy: monitor `no_accounts`, `stream_incomplete`, and `upstream_unavailable`.
 - Websocket/Codex CLI tier verification runbook: `openspec/specs/responses-api-compat/ops.md`

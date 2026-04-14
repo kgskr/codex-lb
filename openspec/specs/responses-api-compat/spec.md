@@ -172,7 +172,7 @@ Before forwarding Responses payloads upstream, the service MUST remove known uns
 - **THEN** the service preserves that field in forwarded payload
 
 ### Requirement: Public OpenAI-compatible route eligibility is provider-aware, transport-aware, and fallback-ordered
-The service MUST treat upstream execution as a provider-aware decision instead of assuming every request targets the ChatGPT-web backend. `chatgpt_web` remains primary and `openai_platform` is fallback-only. Phase-1 Platform fallback covers HTTP `/v1/models`, stateless HTTP `/v1/responses`, HTTP `/backend-api/codex/models`, and stateless HTTP `/backend-api/codex/responses` when the selected routing subject supports the requested route family, transport, model, and required features.
+The service MUST treat upstream execution as a provider-aware decision instead of assuming every request targets the ChatGPT-web backend. `chatgpt_web` remains primary and `openai_platform` is fallback-only. Phase-1 Platform fallback covers HTTP `/v1/models`, stateless HTTP `/v1/responses`, stateless HTTP `/v1/responses/compact`, HTTP `/backend-api/codex/models`, stateless HTTP `/backend-api/codex/responses`, and stateless HTTP `/backend-api/codex/responses/compact` when the selected routing subject supports the requested route family, transport, model, and required features.
 
 #### Scenario: Healthy ChatGPT-web remains primary for stateless public HTTP
 - **WHEN** a request targets an eligible public HTTP route
@@ -182,23 +182,39 @@ The service MUST treat upstream execution as a provider-aware decision instead o
 - **AND** the service does not switch to the Platform transport for that request
 
 #### Scenario: HTTP `/v1/responses` falls back to an OpenAI Platform upstream after the ChatGPT pool is drained
-- **WHEN** the operator enables `openai_platform` for public HTTP routes
+- **WHEN** the deployment includes an `openai_platform` identity
 - **AND** there is at least one active `chatgpt_web` account configured in the deployment
 - **AND** a compatible Platform routing subject is available for the requested model
 - **AND** no compatible ChatGPT-web candidate remains healthy under the configured primary and secondary drain thresholds
 - **AND** the request does not require phase-1 unsupported continuity or websocket capabilities
 - **THEN** the service forwards HTTP `/v1/responses` to the public upstream contract instead of the ChatGPT-private `/codex/responses` path
 
+#### Scenario: HTTP `/v1/responses/compact` falls back to an OpenAI Platform compact upstream after the ChatGPT pool is drained
+- **WHEN** the deployment includes an `openai_platform` identity
+- **AND** there is at least one active `chatgpt_web` account configured in the deployment
+- **AND** a compatible Platform routing subject is available for the requested compact model
+- **AND** no compatible ChatGPT-web candidate remains healthy under the configured fallback thresholds
+- **THEN** the service forwards HTTP `/v1/responses/compact` through the Platform compact transport
+- **AND** it does not rewrite the compact result into a normal Responses payload
+
 #### Scenario: Backend Codex HTTP responses fall back to Platform after the ChatGPT pool is drained
-- **WHEN** the operator enables `openai_platform` for `backend_codex_http`
+- **WHEN** the deployment includes an `openai_platform` identity
 - **AND** there is at least one active `chatgpt_web` account configured in the deployment
 - **AND** a compatible Platform routing subject is available for the requested model
 - **AND** no compatible ChatGPT-web candidate remains healthy under the configured fallback thresholds
 - **AND** the request does not require websocket or payload-level continuity-dependent behavior
 - **THEN** the service forwards HTTP `/backend-api/codex/responses` through the Platform transport instead of the ChatGPT-private upstream path
 
+#### Scenario: Backend Codex HTTP compact responses fall back to Platform after the ChatGPT pool is drained
+- **WHEN** the deployment includes an `openai_platform` identity
+- **AND** there is at least one active `chatgpt_web` account configured in the deployment
+- **AND** a compatible Platform routing subject is available for the requested compact model
+- **AND** no compatible ChatGPT-web candidate remains healthy under the configured fallback thresholds
+- **THEN** the service forwards HTTP `/backend-api/codex/responses/compact` through the Platform compact transport
+- **AND** it preserves the compact result as the canonical next context window
+
 #### Scenario: Backend Codex HTTP model discovery falls back to Platform after the ChatGPT pool is drained
-- **WHEN** the operator enables `openai_platform` for `backend_codex_http`
+- **WHEN** the deployment includes an `openai_platform` identity
 - **AND** there is at least one active `chatgpt_web` account configured in the deployment
 - **AND** a compatible Platform routing subject is available
 - **AND** no compatible ChatGPT-web candidate remains healthy under the configured fallback thresholds
@@ -216,7 +232,7 @@ The service MUST treat upstream execution as a provider-aware decision instead o
 - **AND** it MUST NOT silently substitute a different upstream contract to emulate unsupported behavior
 
 #### Scenario: Public route rejects Platform-only fallback
-- **WHEN** a request targets HTTP `/v1/models` or stateless HTTP `/v1/responses`
+- **WHEN** a request targets HTTP `/v1/models`, stateless HTTP `/v1/responses`, or stateless HTTP `/v1/responses/compact`
 - **AND** an `openai_platform` identity is configured for that route family
 - **AND** no eligible `chatgpt_web` routing subject exists for the requested model and route
 - **THEN** the service rejects the request before upstream transport start with HTTP `400`
@@ -265,10 +281,10 @@ The service MUST derive request capabilities from both route and request shape b
 ### Requirement: Platform mode rejects phase-1 unsupported routes and features
 When the selected upstream provider is `openai_platform`, the service MUST explicitly reject routes and features that still depend on ChatGPT-private or phase-gated contracts until equivalent public semantics are intentionally implemented and verified.
 
-#### Scenario: Platform-backed compact request is rejected in phase 1
+#### Scenario: Platform-backed compact request stays inside the compact contract
 - **WHEN** an `openai_platform` routing subject receives `/v1/responses/compact` or `/backend-api/codex/responses/compact`
-- **THEN** the service returns HTTP `400`
-- **AND** it returns an OpenAI-format error envelope with `type = "invalid_request_error"`, `code = "provider_feature_unsupported"`, and no required `param`
+- **THEN** the service keeps the request on the provider-native compact transport
+- **AND** it MUST NOT substitute a standard `/responses` request or synthesize compact output locally
 
 #### Scenario: Backend Codex websocket remains unsupported for Platform fallback
 - **WHEN** an `openai_platform` routing subject receives `/backend-api/codex/responses` over websocket transport
@@ -304,12 +320,12 @@ For OpenAI-style `/v1/responses`, `/v1/responses/compact`, and chat-completions 
 #### Scenario: recent /v1 responses request reuses prompt-cache affinity
 - **WHEN** a client sends repeated `/v1/responses` requests with the same non-empty `prompt_cache_key` while `sticky_threads_enabled` is disabled
 - **AND** the previous mapping is still within the configured freshness window
-- **THEN** the service selects the same upstream account for those requests
+- **THEN** the service selects the same upstream routing target for those requests
 
 #### Scenario: recent /v1 compact request reuses prompt-cache affinity
 - **WHEN** a client sends `/v1/responses/compact` after `/v1/responses` with the same non-empty `prompt_cache_key` while `sticky_threads_enabled` is disabled
 - **AND** the previous mapping is still within the configured freshness window
-- **THEN** the compact request reuses the previously selected upstream account
+- **THEN** the compact request reuses the previously selected upstream routing target
 
 #### Scenario: expired prompt-cache affinity rebalances
 - **WHEN** a client sends a later OpenAI-style request with the same non-empty `prompt_cache_key`
@@ -325,6 +341,12 @@ For OpenAI-style `/v1/responses`, `/v1/responses/compact`, and chat-completions 
 - **AND** the selected upstream provider is `openai_platform`
 - **AND** the existing mapping is still within the configured freshness window
 - **THEN** the service reuses the same provider-scoped routing target for those requests
+
+#### Scenario: Prompt-cache affinity does not suppress a drained public fallback decision
+- **WHEN** a public stateless HTTP request carries a bounded `prompt_cache_key` affinity
+- **AND** no compatible ChatGPT-web candidate remains selectable and above the configured fallback thresholds
+- **THEN** the service MAY route the request to `openai_platform`
+- **AND** prompt-cache affinity alone MUST NOT keep the request on ChatGPT
 
 ### Requirement: HTTP Responses routes preserve upstream continuity only for providers that advertise it
 When the selected upstream provider exposes durable upstream continuity for HTTP Responses routes, the service MUST preserve that continuity on a stable bridge key. When the selected upstream provider does not expose equivalent continuity semantics for the requested route family, the service MUST NOT synthesize ChatGPT-style continuity or silently open a different provider contract to satisfy the request.
@@ -513,10 +535,10 @@ When a backend Codex Responses or compact request includes a non-empty `session_
 - **THEN** the retry forwards the refreshed account's `chatgpt-account-id` header instead of reusing the pre-refresh account header
 
 ### Requirement: Compact requests preserve upstream compaction semantics
-The service MUST not impose a dedicated compact request total or read timeout for `/responses/compact` requests. To preserve provider-owned remote compaction semantics, the service MUST fulfill `/backend-api/codex/responses/compact` and `/v1/responses/compact` by calling the upstream ChatGPT Codex `/codex/responses/compact` endpoint directly and returning the upstream JSON payload as the canonical next context window without converting it into a standard buffered Responses result. The service MUST preserve provider-owned compact payload contents without pruning, reordering, or rewriting returned context items beyond generic JSON serialization. While using this direct compact transport, the service MUST preserve compact account-selection semantics, `session_id` affinity, `prompt_cache_key` affinity, `401` refresh-and-retry behavior, API key settlement, and HTTP request logging. The service MUST reject `store=true` as a client payload error, and it MUST omit `store` from the direct upstream compact request instead of forwarding `store=false`. If direct upstream compact execution fails before a valid compact JSON payload is accepted, the service MUST keep the request inside the compact contract. It MUST NOT silently substitute `/codex/responses`, reconstruct compact output from streamed Responses events, or synthesize a compact window locally. The service MAY perform a bounded retry only against `/codex/responses/compact` when the failure occurs in a provably safe transport phase before a valid compact JSON payload is accepted.
+The service MUST preserve the selected provider's native compact contract for `/backend-api/codex/responses/compact` and `/v1/responses/compact`. To preserve provider-owned remote compaction semantics, the service MUST fulfill compact requests by calling the selected provider's native compact endpoint directly and returning the upstream JSON payload as the canonical next context window without converting it into a standard buffered Responses result. The service MUST preserve provider-owned compact payload contents without pruning, reordering, or rewriting returned context items beyond generic JSON serialization. While using this direct compact transport, the service MUST preserve compact account-selection semantics, `session_id` affinity, `prompt_cache_key` affinity, bounded same-contract retries, API key settlement, and HTTP request logging. The service MUST reject `store=true` as a client payload error, and it MUST omit `store` from the direct upstream compact request instead of forwarding `store=false`. If direct upstream compact execution fails before a valid compact JSON payload is accepted, the service MUST keep the request inside the selected provider's compact contract. It MUST NOT silently substitute a standard `/responses` request, reconstruct compact output from streamed Responses events, or synthesize a compact window locally. The service MAY apply provider-specific transport timeouts and bounded retries only against the selected provider's compact endpoint when the failure occurs in a provably safe transport phase before a valid compact JSON payload is accepted.
 
 #### Scenario: Compact request returns raw upstream compaction payload
-- **WHEN** a compact request succeeds and the upstream `/codex/responses/compact` response contains `object: "response.compaction"`
+- **WHEN** a compact request succeeds and the selected provider's compact endpoint returns `object: "response.compaction"`
 - **THEN** the service returns that JSON payload without rewriting it into `object: "response"`
 
 #### Scenario: Compact request preserves provider-owned compaction summary
@@ -533,7 +555,7 @@ The service MUST not impose a dedicated compact request total or read timeout fo
 
 #### Scenario: Direct compact request omits store
 - **WHEN** a client sends `/backend-api/codex/responses/compact` or `/v1/responses/compact` without a `store` field
-- **THEN** the direct upstream `/codex/responses/compact` request omits `store`
+- **THEN** the selected provider-native compact request omits `store`
 
 #### Scenario: Direct compact request sets store true
 - **WHEN** a client sends `/backend-api/codex/responses/compact` or `/v1/responses/compact` with `store=true`
@@ -541,28 +563,35 @@ The service MUST not impose a dedicated compact request total or read timeout fo
 - **AND** it does not forward any `store` field upstream
 
 #### Scenario: Direct compact upstream returns an error envelope
-- **WHEN** the upstream direct compact request returns a non-2xx OpenAI-format error payload
+- **WHEN** the selected provider-native compact request returns a non-2xx OpenAI-format error payload
 - **THEN** the service propagates the corresponding HTTP status and error envelope to the client
 
+#### Scenario: Backend Codex compact falls back to public Platform compact transport
+- **WHEN** a client sends `/backend-api/codex/responses/compact`
+- **AND** the selected upstream provider is `openai_platform`
+- **THEN** the service translates the request onto the public Platform compact contract
+- **AND** it still returns the resulting compact payload unchanged to the backend Codex client
+
 #### Scenario: Direct compact transport fails before response body is available
-- **WHEN** the upstream `/codex/responses/compact` call times out, disconnects, or otherwise fails before yielding a valid compact JSON payload
-- **THEN** the service may retry only `/codex/responses/compact` within a bounded retry budget
-- **AND** it does not attempt a surrogate `/codex/responses` request
+- **WHEN** the selected provider's compact call times out, disconnects, or otherwise fails before yielding a valid compact JSON payload
+- **THEN** the service may retry only that provider's compact endpoint within a bounded retry budget
+- **AND** it does not attempt a surrogate standard `/responses` request
 
 #### Scenario: Direct compact transport gets a safe retryable upstream failure
-- **WHEN** the upstream `/codex/responses/compact` call fails with `401`, `502`, `503`, or `504` before a valid compact JSON payload is accepted
-- **THEN** the service may retry only `/codex/responses/compact`
+- **WHEN** the selected provider's compact call fails with `401`, `502`, `503`, or `504` before a valid compact JSON payload is accepted
+- **THEN** the service may retry only that provider's compact endpoint
 - **AND** it preserves the request's established compact routing and affinity semantics except for refreshed provider identity on `401`
-- **AND** it does not call `/codex/responses`
+- **AND** it does not call a standard `/responses` endpoint
 
 #### Scenario: Direct compact response payload is invalid
-- **WHEN** the upstream `/codex/responses/compact` call returns a non-error payload that is not valid compact JSON for pass-through
+- **WHEN** the selected provider's compact call returns a non-error payload that is not valid compact JSON for pass-through
 - **THEN** the service returns an upstream error to the client
-- **AND** it does not retry via `/codex/responses`
+- **AND** it does not retry via a standard `/responses` endpoint
 - **AND** it does not synthesize or reconstruct a replacement compact window
 
-#### Scenario: Compact request uses no timeout by default
-- **WHEN** `/responses/compact` is called and no compact timeout override is configured
+#### Scenario: ChatGPT compact request uses no timeout by default
+- **WHEN** `/responses/compact` is routed to the `chatgpt_web` compact endpoint
+- **AND** no compact timeout override is configured
 - **THEN** the service forwards the request without setting an upstream total or read timeout
 
 ### Requirement: Persist request log transport for Responses requests

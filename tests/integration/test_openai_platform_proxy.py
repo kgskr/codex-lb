@@ -20,19 +20,28 @@ import app.modules.proxy.service as proxy_service_module
 import app.modules.upstream_identities.repository as platform_repository_module
 from app.core.clients.openai_platform import (
     OpenAIPlatformError,
+    PlatformCompactResponseResult,
     PlatformModelsResponse,
     PlatformResponseResult,
     PlatformStreamResponse,
 )
 from app.core.crypto import TokenEncryptor
 from app.core.openai.model_registry import ReasoningLevel, UpstreamModel, get_model_registry
-from app.core.openai.models import OpenAIResponsePayload
+from app.core.openai.models import CompactResponsePayload, OpenAIResponsePayload
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, OpenAIPlatformIdentity, RequestLog
+from app.db.models import Account, AccountStatus, OpenAIPlatformIdentity, RequestLog, StickySession, StickySessionKind
 from app.db.session import SessionLocal
+from app.modules.upstream_identities.types import PlatformRouteFamily
 from app.modules.usage.repository import UsageRepository
 
 pytestmark = pytest.mark.integration
+
+EXPECTED_PLATFORM_ROUTE_FAMILY_TUPLE: tuple[PlatformRouteFamily, ...] = (
+    "backend_codex_http",
+    "public_models_http",
+    "public_responses_http",
+)
+EXPECTED_PLATFORM_ROUTE_FAMILIES = list(EXPECTED_PLATFORM_ROUTE_FAMILY_TUPLE)
 
 
 def _make_upstream_model(slug: str) -> UpstreamModel:
@@ -170,7 +179,27 @@ async def _seed_secondary_usage(account_id: str, used_percent: float) -> None:
     await _seed_usage(account_id, window="secondary", used_percent=used_percent, reset_after_seconds=86400)
 
 
+async def _set_account_status(
+    account_id: str,
+    *,
+    status: AccountStatus,
+    reset_after_seconds: int | None = None,
+) -> None:
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Account).where((Account.id == account_id) | (Account.chatgpt_account_id == account_id)).limit(1)
+        )
+        account = result.scalar_one()
+        account.status = status
+        account.reset_at = None if reset_after_seconds is None else now_epoch + reset_after_seconds
+        await session.commit()
+
+
 async def _create_platform_identity(async_client, monkeypatch, *, route_families: list[str] | None = None) -> str:
+    del route_families
+
     async def fake_validate_platform_identity(self, *, api_key, organization=None, project=None):
         del self, api_key, organization, project
         return PlatformModelsResponse(
@@ -193,7 +222,6 @@ async def _create_platform_identity(async_client, monkeypatch, *, route_families
             "apiKey": "sk-platform-test",
             "organization": "org_test",
             "project": "proj_test",
-            "eligibleRouteFamilies": route_families or ["public_responses_http", "public_models_http"],
         },
     )
     assert response.status_code == 200
@@ -201,13 +229,14 @@ async def _create_platform_identity(async_client, monkeypatch, *, route_families
 
 
 async def _insert_platform_identity_direct(route_families: list[str] | None = None) -> str:
+    del route_families
     identity = OpenAIPlatformIdentity(
         id="plat_direct",
         label="Platform Key",
         api_key_encrypted=TokenEncryptor().encrypt("sk-platform-test"),
         organization_id="org_test",
         project_id="proj_test",
-        eligible_route_families=",".join(route_families or ["public_responses_http", "public_models_http"]),
+        eligible_route_families=",".join(EXPECTED_PLATFORM_ROUTE_FAMILIES),
         status=AccountStatus.ACTIVE,
         last_validated_at=None,
         last_auth_failure_reason=None,
@@ -220,12 +249,12 @@ async def _insert_platform_identity_direct(route_families: list[str] | None = No
 
 
 def _platform_identity_payload(route_families: list[str] | None = None) -> dict[str, object]:
+    del route_families
     return {
         "label": "Platform Key",
         "apiKey": "sk-platform-test",
         "organization": "org_test",
         "project": "proj_test",
-        "eligibleRouteFamilies": route_families or ["public_responses_http", "public_models_http"],
     }
 
 
@@ -238,6 +267,12 @@ async def _latest_request_log() -> RequestLog | None:
     async with SessionLocal() as session:
         result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
         return result.scalars().first()
+
+
+async def _request_log_count() -> int:
+    async with SessionLocal() as session:
+        result = await session.execute(select(RequestLog.id))
+        return len(result.scalars().all())
 
 
 @pytest.mark.asyncio
@@ -253,10 +288,7 @@ async def test_create_and_list_platform_identity(async_client, monkeypatch):
     assert platform_identity["providerKind"] == "openai_platform"
     assert platform_identity["routingSubjectId"] == identity_id
     assert platform_identity["label"] == "Platform Key"
-    assert sorted(platform_identity["eligibleRouteFamilies"]) == [
-        "public_models_http",
-        "public_responses_http",
-    ]
+    assert platform_identity["eligibleRouteFamilies"] == EXPECTED_PLATFORM_ROUTE_FAMILIES
     assert platform_identity["organization"] == "org_test"
     assert platform_identity["project"] == "proj_test"
 
@@ -715,39 +747,10 @@ async def test_v1_responses_falls_back_to_platform_when_other_candidate_has_part
 
 
 @pytest.mark.asyncio
-async def test_updating_platform_route_families_enables_public_responses_fallback(async_client, monkeypatch):
+async def test_platform_identity_automatically_enables_public_responses_fallback(async_client, monkeypatch):
     account_id = await _import_account(async_client, "acc_resp_route_edit", "resp-route-edit@example.com")
     await _seed_primary_usage(account_id, 95.0)
     identity_id = await _create_platform_identity(async_client, monkeypatch, route_families=["public_models_http"])
-
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kw):
-        del payload, headers, access_token, base_url, raise_for_status, _kw
-        assert account_id == "acc_resp_route_edit"
-        yield (
-            'data: {"type":"response.completed","response":{"id":"resp_chatgpt_before_route_edit","status":"completed",'
-            '"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}\n\n'
-        )
-
-    async def fail_create_platform_response(*, base_url, payload, api_key, organization=None, project=None):
-        del base_url, payload, api_key, organization, project
-        raise AssertionError("platform fallback must stay disabled until public_responses_http is enabled")
-
-    monkeypatch.setattr(provider_adapters_module, "core_stream_responses", fake_stream)
-    monkeypatch.setattr(provider_adapters_module, "create_platform_response", fail_create_platform_response)
-
-    initial_response = await async_client.post("/v1/responses", json={"model": "gpt-5.1", "input": "hi"})
-    assert initial_response.status_code == 200
-    assert initial_response.json()["id"] == "resp_chatgpt_before_route_edit"
-
-    update_response = await async_client.patch(
-        f"/api/accounts/platform/{identity_id}",
-        json={"eligibleRouteFamilies": ["public_models_http", "public_responses_http"]},
-    )
-    assert update_response.status_code == 200
-    assert sorted(update_response.json()["eligibleRouteFamilies"]) == [
-        "public_models_http",
-        "public_responses_http",
-    ]
 
     async def fake_create_platform_response(*, base_url, payload, api_key, organization=None, project=None):
         del base_url, api_key, organization, project
@@ -774,7 +777,7 @@ async def test_updating_platform_route_families_enables_public_responses_fallbac
         **_kw,
     ):
         del payload, headers, access_token, account_id, base_url, raise_for_status, _kw
-        raise AssertionError("platform fallback should take over after enabling public_responses_http")
+        raise AssertionError("platform fallback should take over immediately after identity registration")
 
     monkeypatch.setattr(provider_adapters_module, "create_platform_response", fake_create_platform_response)
     monkeypatch.setattr(provider_adapters_module, "core_stream_responses", fail_stream_after_route_edit)
@@ -782,6 +785,13 @@ async def test_updating_platform_route_families_enables_public_responses_fallbac
     fallback_response = await async_client.post("/v1/responses", json={"model": "gpt-5.1", "input": "hi"})
     assert fallback_response.status_code == 200
     assert fallback_response.json()["id"] == "resp_platform_after_route_edit"
+
+    detail_response = await async_client.get("/api/accounts")
+    assert detail_response.status_code == 200
+    platform_identity = next(
+        account for account in detail_response.json()["accounts"] if account["accountId"] == identity_id
+    )
+    assert platform_identity["eligibleRouteFamilies"] == EXPECTED_PLATFORM_ROUTE_FAMILIES
 
 
 @pytest.mark.asyncio
@@ -860,6 +870,37 @@ async def test_v1_responses_stream_returns_502_when_platform_stream_fails_before
     assert log.routing_subject_id == identity_id
     assert log.error_code == "upstream_unavailable"
     assert log.rejection_reason == "platform_stream_start_failed"
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_stream_returns_502_when_platform_stream_is_empty(async_client, monkeypatch):
+    account_id = await _import_account(async_client, "acc_resp_stream_empty", "resp-stream-empty@example.com")
+    await _seed_primary_usage(account_id, 95.0)
+    identity_id = await _create_platform_identity(async_client, monkeypatch, route_families=["public_responses_http"])
+
+    async def fake_stream_platform_responses(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, payload, api_key, organization, project
+        return PlatformStreamResponse(
+            event_stream=_stream_lines([]),
+            upstream_request_id="up_req_resp_stream_empty",
+        )
+
+    monkeypatch.setattr(provider_adapters_module, "stream_platform_responses", fake_stream_platform_responses)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.1", "input": "hi", "stream": True},
+    )
+    assert response.status_code == 502
+    payload = response.json()
+    assert payload["error"]["code"] == "upstream_unavailable"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "openai_platform"
+    assert log.routing_subject_id == identity_id
+    assert log.rejection_reason == "platform_stream_start_failed"
+    assert log.upstream_request_id == "up_req_resp_stream_empty"
 
 
 @pytest.mark.asyncio
@@ -1194,7 +1235,7 @@ async def test_platform_only_rejects_compact_and_backend_codex_unsupported_route
 
     async def fail_compact_responses(self, *args, **kwargs):
         del self, args, kwargs
-        raise AssertionError("rejected compact path must not start upstream transport")
+        raise AssertionError("platform-only compact path must fail before upstream transport")
 
     def fail_stream_http_responses(self, *args, **kwargs):
         del self, args, kwargs
@@ -1208,14 +1249,14 @@ async def test_platform_only_rejects_compact_and_backend_codex_unsupported_route
         json={"model": "gpt-5.1", "input": "hi"},
     )
     assert compact_response.status_code == 400
-    assert compact_response.json()["error"]["code"] == "provider_feature_unsupported"
+    assert compact_response.json()["error"]["code"] == "provider_fallback_requires_chatgpt"
 
     backend_compact_response = await async_client.post(
         "/backend-api/codex/responses/compact",
         json={"model": "gpt-5.1", "instructions": "hi", "input": []},
     )
     assert backend_compact_response.status_code == 400
-    assert backend_compact_response.json()["error"]["code"] == "provider_feature_unsupported"
+    assert backend_compact_response.json()["error"]["code"] == "provider_fallback_requires_chatgpt"
 
     backend_response = await async_client.post(
         "/backend-api/codex/responses",
@@ -1223,6 +1264,752 @@ async def test_platform_only_rejects_compact_and_backend_codex_unsupported_route
     )
     assert backend_response.status_code == 400
     assert backend_response.json()["error"]["code"] == "provider_fallback_requires_chatgpt"
+
+
+@pytest.mark.asyncio
+async def test_v1_compact_falls_back_to_platform_when_primary_usage_is_depleted(async_client, monkeypatch):
+    account_id = await _import_account(async_client, "acc_v1_compact_fallback", "v1-compact-fallback@example.com")
+    await _seed_primary_usage(account_id, 95.0)
+    identity_id = await _create_platform_identity(async_client, monkeypatch)
+
+    async def fake_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, api_key, organization, project
+        assert payload["model"] == "gpt-5.1"
+        assert payload["instructions"] == ""
+        _assert_platform_text_input(payload, "hi")
+        assert "store" not in payload
+        return PlatformCompactResponseResult(
+            payload=CompactResponsePayload.model_validate(
+                {
+                    "object": "response.compaction",
+                    "status": "completed",
+                    "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                    "output": [],
+                }
+            ),
+            upstream_request_id="up_req_v1_compact_fallback",
+        )
+
+    async def fail_chatgpt_compact(_payload, _headers, _access_token, _account_id):
+        raise AssertionError("platform compact fallback should bypass ChatGPT compact transport")
+
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fake_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fail_chatgpt_compact)
+
+    response = await async_client.post("/v1/responses/compact", json={"model": "gpt-5.1", "input": "hi"})
+    assert response.status_code == 200
+    assert response.json()["object"] == "response.compaction"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "openai_platform"
+    assert log.routing_subject_id == identity_id
+    assert log.route_class == "openai_public_http"
+    assert log.upstream_request_id == "up_req_v1_compact_fallback"
+
+
+@pytest.mark.asyncio
+async def test_v1_compact_falls_back_to_platform_and_rebinds_prompt_cache_affinity(async_client, monkeypatch):
+    account_id = await _import_account(
+        async_client,
+        "acc_v1_compact_prompt_cache_fallback",
+        "v1-compact-prompt-cache@example.com",
+    )
+    await _seed_primary_usage(account_id, 95.0)
+    await _seed_secondary_usage(account_id, 95.0)
+    identity_id = await _create_platform_identity(async_client, monkeypatch)
+
+    async def fake_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, api_key, organization, project
+        assert payload["model"] == "gpt-5.1"
+        return PlatformCompactResponseResult(
+            payload=CompactResponsePayload.model_validate(
+                {
+                    "object": "response.compaction",
+                    "status": "completed",
+                    "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                    "output": [],
+                }
+            ),
+            upstream_request_id="up_req_v1_compact_prompt_cache",
+        )
+
+    async def fail_chatgpt_compact(_payload, _headers, _access_token, _account_id):
+        raise AssertionError("prompt-cache fallback must bypass ChatGPT compact transport")
+
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fake_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fail_chatgpt_compact)
+
+    response = await async_client.post(
+        "/v1/responses/compact",
+        json={"model": "gpt-5.1", "input": "hi", "prompt_cache_key": "cache-key-v1-compact"},
+    )
+    assert response.status_code == 200
+
+    async with SessionLocal() as session:
+        sticky = await session.scalar(
+            select(StickySession).where(
+                StickySession.key == "cache-key-v1-compact",
+                StickySession.kind == StickySessionKind.PROMPT_CACHE,
+            )
+        )
+
+    assert sticky is not None
+    assert sticky.provider_kind == "openai_platform"
+    assert sticky.routing_subject_id == identity_id
+
+
+@pytest.mark.asyncio
+async def test_v1_compact_keeps_chatgpt_primary_when_any_account_in_pool_is_healthy(async_client, monkeypatch):
+    drained_account_id = await _import_account(
+        async_client,
+        "acc_v1_compact_drained",
+        "v1-compact-drained@example.com",
+    )
+    healthy_account_id = await _import_account(
+        async_client,
+        "acc_v1_compact_healthy",
+        "v1-compact-healthy@example.com",
+    )
+    await _seed_primary_usage(drained_account_id, 95.0)
+    await _seed_secondary_usage(drained_account_id, 95.0)
+    await _seed_primary_usage(healthy_account_id, 10.0)
+    await _seed_secondary_usage(healthy_account_id, 10.0)
+    await _create_platform_identity(async_client, monkeypatch)
+
+    async def fail_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, payload, api_key, organization, project
+        raise AssertionError("a healthy ChatGPT candidate must keep compact fallback on ChatGPT")
+
+    async def fake_chatgpt_compact(payload, headers, access_token, account_id):
+        del headers, access_token
+        assert payload.model == "gpt-5.1"
+        assert account_id == "acc_v1_compact_healthy"
+        return CompactResponsePayload.model_validate(
+            {
+                "object": "response.compaction",
+                "status": "completed",
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                "output": [],
+            }
+        )
+
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fail_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fake_chatgpt_compact)
+
+    response = await async_client.post("/v1/responses/compact", json={"model": "gpt-5.1", "input": "hi"})
+    assert response.status_code == 200
+    assert response.json()["object"] == "response.compaction"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "chatgpt_web"
+    assert log.account_id == healthy_account_id
+    assert log.route_class == "openai_public_http"
+
+
+@pytest.mark.asyncio
+async def test_v1_compact_falls_back_to_platform_when_secondary_usage_is_depleted(async_client, monkeypatch):
+    account_id = await _import_account(
+        async_client,
+        "acc_v1_compact_secondary_fallback",
+        "v1-compact-secondary@example.com",
+    )
+    await _seed_primary_usage(account_id, 10.0)
+    await _seed_secondary_usage(account_id, 95.0)
+    identity_id = await _create_platform_identity(async_client, monkeypatch)
+
+    async def fake_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, api_key, organization, project
+        assert payload["model"] == "gpt-5.1"
+        assert payload["instructions"] == ""
+        _assert_platform_text_input(payload, "hi")
+        return PlatformCompactResponseResult(
+            payload=CompactResponsePayload.model_validate(
+                {
+                    "object": "response.compaction",
+                    "status": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                    "output": [],
+                }
+            ),
+            upstream_request_id="up_req_v1_compact_secondary_fallback",
+        )
+
+    async def fail_chatgpt_compact(_payload, _headers, _access_token, _account_id):
+        raise AssertionError("secondary-drained compact fallback should bypass ChatGPT compact transport")
+
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fake_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fail_chatgpt_compact)
+
+    response = await async_client.post("/v1/responses/compact", json={"model": "gpt-5.1", "input": "hi"})
+    assert response.status_code == 200
+    assert response.json()["object"] == "response.compaction"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "openai_platform"
+    assert log.routing_subject_id == identity_id
+    assert log.route_class == "openai_public_http"
+    assert log.upstream_request_id == "up_req_v1_compact_secondary_fallback"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth_status", [401, 403])
+async def test_v1_compact_retries_with_next_platform_identity_after_auth_failure(
+    async_client,
+    monkeypatch,
+    auth_status: int,
+):
+    account_id = await _import_account(
+        async_client,
+        "acc_v1_compact_platform_failover",
+        "v1-compact-platform-failover@example.com",
+    )
+    await _seed_primary_usage(account_id, 95.0)
+
+    first_identity_id = await _create_platform_identity(async_client, monkeypatch)
+    second_identity_id = "plat_compact_failover_secondary"
+    second_identity = OpenAIPlatformIdentity(
+        id=second_identity_id,
+        label="Platform Key Secondary",
+        api_key_encrypted=TokenEncryptor().encrypt("sk-platform-secondary"),
+        organization_id="org_test",
+        project_id="proj_test",
+        eligible_route_families=",".join(EXPECTED_PLATFORM_ROUTE_FAMILIES),
+        status=AccountStatus.ACTIVE,
+        last_validated_at=None,
+        last_auth_failure_reason=None,
+        deactivation_reason=None,
+    )
+
+    original_list_eligible_identities = (
+        platform_repository_module.OpenAIPlatformIdentitiesRepository.list_eligible_identities
+    )
+    original_get_by_id = platform_repository_module.OpenAIPlatformIdentitiesRepository.get_by_id
+
+    async def fake_list_eligible_identities(self, route_family: PlatformRouteFamily):
+        identities = await original_list_eligible_identities(self, route_family)
+        return [*identities, second_identity]
+
+    async def fake_get_by_id(self, identity_id: str):
+        if identity_id == second_identity_id:
+            return second_identity
+        return await original_get_by_id(self, identity_id)
+
+    async def fake_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, organization, project
+        assert payload["model"] == "gpt-5.1"
+        if api_key == "sk-platform-test":
+            raise OpenAIPlatformError(
+                auth_status,
+                {
+                    "error": {
+                        "code": "invalid_api_key",
+                        "message": "Invalid API key",
+                    }
+                },
+                upstream_request_id="up_req_v1_compact_failover_primary",
+            )
+        assert api_key == "sk-platform-secondary"
+        return PlatformCompactResponseResult(
+            payload=CompactResponsePayload.model_validate(
+                {
+                    "object": "response.compaction",
+                    "status": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                    "output": [],
+                }
+            ),
+            upstream_request_id="up_req_v1_compact_failover_secondary",
+        )
+
+    async def fail_chatgpt_compact(_payload, _headers, _access_token, _account_id):
+        raise AssertionError("platform compact failover should not retry ChatGPT after pool drain")
+
+    monkeypatch.setattr(
+        platform_repository_module.OpenAIPlatformIdentitiesRepository,
+        "list_eligible_identities",
+        fake_list_eligible_identities,
+    )
+    monkeypatch.setattr(
+        platform_repository_module.OpenAIPlatformIdentitiesRepository,
+        "get_by_id",
+        fake_get_by_id,
+    )
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fake_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fail_chatgpt_compact)
+
+    response = await async_client.post("/v1/responses/compact", json={"model": "gpt-5.1", "input": "hi"})
+    assert response.status_code == 200
+    assert response.json()["object"] == "response.compaction"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "openai_platform"
+    assert log.routing_subject_id == second_identity_id
+    assert log.route_class == "openai_public_http"
+    assert log.upstream_request_id == "up_req_v1_compact_failover_secondary"
+
+    async with SessionLocal() as session:
+        first_identity = await session.get(OpenAIPlatformIdentity, first_identity_id)
+
+    assert first_identity is not None
+    assert first_identity.status == AccountStatus.DEACTIVATED
+    assert first_identity.last_auth_failure_reason == "Invalid API key"
+
+
+@pytest.mark.asyncio
+async def test_backend_codex_compact_falls_back_to_platform_when_primary_usage_is_depleted(async_client, monkeypatch):
+    account_id = await _import_account(
+        async_client,
+        "acc_backend_compact_fallback",
+        "backend-compact-fallback@example.com",
+    )
+    await _seed_primary_usage(account_id, 95.0)
+    identity_id = await _create_platform_identity(async_client, monkeypatch)
+
+    async def fake_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, api_key, organization, project
+        assert payload["model"] == "gpt-5.1"
+        assert payload["instructions"] == "compact"
+        assert payload["input"] == []
+        assert "store" not in payload
+        return PlatformCompactResponseResult(
+            payload=CompactResponsePayload.model_validate(
+                {
+                    "object": "response.compaction",
+                    "status": "completed",
+                    "usage": {"input_tokens": 4, "output_tokens": 5, "total_tokens": 9},
+                    "output": [],
+                }
+            ),
+            upstream_request_id="up_req_backend_compact_fallback",
+        )
+
+    async def fail_chatgpt_compact(_payload, _headers, _access_token, _account_id):
+        raise AssertionError("platform compact fallback should bypass ChatGPT compact transport")
+
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fake_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fail_chatgpt_compact)
+
+    response = await async_client.post(
+        "/backend-api/codex/responses/compact",
+        json={"model": "gpt-5.1", "instructions": "compact", "input": []},
+    )
+    assert response.status_code == 200
+    assert response.json()["object"] == "response.compaction"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "openai_platform"
+    assert log.routing_subject_id == identity_id
+    assert log.route_class == "chatgpt_private"
+    assert log.upstream_request_id == "up_req_backend_compact_fallback"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth_status", [401, 403])
+async def test_backend_codex_compact_retries_with_next_platform_identity_after_auth_failure(
+    async_client,
+    monkeypatch,
+    auth_status: int,
+):
+    account_id = await _import_account(
+        async_client,
+        "acc_backend_compact_platform_failover",
+        "backend-compact-platform-failover@example.com",
+    )
+    await _seed_primary_usage(account_id, 95.0)
+
+    first_identity_id = await _create_platform_identity(async_client, monkeypatch)
+    second_identity_id = "plat_backend_compact_failover_secondary"
+    second_identity = OpenAIPlatformIdentity(
+        id=second_identity_id,
+        label="Platform Key Secondary",
+        api_key_encrypted=TokenEncryptor().encrypt("sk-platform-secondary"),
+        organization_id="org_test",
+        project_id="proj_test",
+        eligible_route_families=",".join(EXPECTED_PLATFORM_ROUTE_FAMILIES),
+        status=AccountStatus.ACTIVE,
+        last_validated_at=None,
+        last_auth_failure_reason=None,
+        deactivation_reason=None,
+    )
+
+    original_list_eligible_identities = (
+        platform_repository_module.OpenAIPlatformIdentitiesRepository.list_eligible_identities
+    )
+    original_get_by_id = platform_repository_module.OpenAIPlatformIdentitiesRepository.get_by_id
+
+    async def fake_list_eligible_identities(self, route_family: PlatformRouteFamily):
+        identities = await original_list_eligible_identities(self, route_family)
+        return [*identities, second_identity]
+
+    async def fake_get_by_id(self, identity_id: str):
+        if identity_id == second_identity_id:
+            return second_identity
+        return await original_get_by_id(self, identity_id)
+
+    async def fake_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, organization, project
+        assert payload["model"] == "gpt-5.1"
+        assert payload["instructions"] == "compact"
+        assert payload["input"] == []
+        if api_key == "sk-platform-test":
+            raise OpenAIPlatformError(
+                auth_status,
+                {
+                    "error": {
+                        "code": "invalid_api_key",
+                        "message": "Invalid API key",
+                    }
+                },
+                upstream_request_id="up_req_backend_compact_failover_primary",
+            )
+        assert api_key == "sk-platform-secondary"
+        return PlatformCompactResponseResult(
+            payload=CompactResponsePayload.model_validate(
+                {
+                    "object": "response.compaction",
+                    "status": "completed",
+                    "usage": {"input_tokens": 4, "output_tokens": 5, "total_tokens": 9},
+                    "output": [],
+                }
+            ),
+            upstream_request_id="up_req_backend_compact_failover_secondary",
+        )
+
+    async def fail_chatgpt_compact(_payload, _headers, _access_token, _account_id):
+        raise AssertionError("platform compact failover should not retry ChatGPT after backend pool drain")
+
+    monkeypatch.setattr(
+        platform_repository_module.OpenAIPlatformIdentitiesRepository,
+        "list_eligible_identities",
+        fake_list_eligible_identities,
+    )
+    monkeypatch.setattr(
+        platform_repository_module.OpenAIPlatformIdentitiesRepository,
+        "get_by_id",
+        fake_get_by_id,
+    )
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fake_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fail_chatgpt_compact)
+
+    response = await async_client.post(
+        "/backend-api/codex/responses/compact",
+        json={"model": "gpt-5.1", "instructions": "compact", "input": []},
+    )
+    assert response.status_code == 200
+    assert response.json()["object"] == "response.compaction"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "openai_platform"
+    assert log.routing_subject_id == second_identity_id
+    assert log.route_class == "chatgpt_private"
+    assert log.upstream_request_id == "up_req_backend_compact_failover_secondary"
+
+    async with SessionLocal() as session:
+        first_identity = await session.get(OpenAIPlatformIdentity, first_identity_id)
+
+    assert first_identity is not None
+    assert first_identity.status == AccountStatus.DEACTIVATED
+    assert first_identity.last_auth_failure_reason == "Invalid API key"
+
+
+@pytest.mark.parametrize(
+    "header_name",
+    ["session_id", "x-codex-session-id", "x-codex-conversation-id"],
+)
+@pytest.mark.asyncio
+async def test_backend_codex_compact_keeps_sticky_chatgpt_session_during_rate_limit_grace(
+    async_client,
+    monkeypatch,
+    header_name: str,
+):
+    sticky_account_id = await _import_account(
+        async_client,
+        "acc_backend_compact_sticky_grace",
+        "backend-compact-sticky-grace@example.com",
+    )
+    await _seed_primary_usage(sticky_account_id, 10.0)
+    await _seed_secondary_usage(sticky_account_id, 10.0)
+    await _set_account_status(sticky_account_id, status=AccountStatus.RATE_LIMITED, reset_after_seconds=5)
+    drained_account_id = await _import_account(
+        async_client,
+        "acc_backend_compact_sticky_grace_drained",
+        "backend-compact-sticky-grace-drained@example.com",
+    )
+    await _seed_primary_usage(drained_account_id, 95.0)
+    await _seed_secondary_usage(drained_account_id, 95.0)
+    await _create_platform_identity(async_client, monkeypatch)
+
+    session_key = f"backend-compact-session-{header_name}"
+    async with SessionLocal() as session:
+        session.add(
+            StickySession(
+                key=session_key,
+                kind=StickySessionKind.CODEX_SESSION,
+                provider_kind="chatgpt_web",
+                routing_subject_id=sticky_account_id,
+                account_id=sticky_account_id,
+            )
+        )
+        await session.commit()
+
+    async def fail_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, payload, api_key, organization, project
+        raise AssertionError("grace-eligible sticky ChatGPT session must keep backend compact on ChatGPT")
+
+    async def fake_chatgpt_compact(payload, headers, access_token, account_id):
+        del headers, access_token
+        assert payload.model == "gpt-5.1"
+        assert account_id == "acc_backend_compact_sticky_grace"
+        return CompactResponsePayload.model_validate(
+            {
+                "object": "response.compaction",
+                "status": "completed",
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                "output": [],
+            }
+        )
+
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fail_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fake_chatgpt_compact)
+
+    response = await async_client.post(
+        "/backend-api/codex/responses/compact",
+        headers={header_name: session_key},
+        json={"model": "gpt-5.1", "instructions": "compact", "input": []},
+    )
+    assert response.status_code == 200
+    assert response.json()["object"] == "response.compaction"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "chatgpt_web"
+    assert log.account_id == sticky_account_id
+    assert log.route_class == "chatgpt_private"
+
+
+@pytest.mark.asyncio
+async def test_backend_codex_compact_keeps_chatgpt_when_any_account_in_pool_is_healthy(async_client, monkeypatch):
+    drained_account_id = await _import_account(
+        async_client,
+        "acc_backend_compact_pool_drained",
+        "backend-compact-pool-drained@example.com",
+    )
+    healthy_account_id = await _import_account(
+        async_client,
+        "acc_backend_compact_pool_healthy",
+        "backend-compact-pool-healthy@example.com",
+    )
+    await _seed_primary_usage(drained_account_id, 95.0)
+    await _seed_secondary_usage(drained_account_id, 95.0)
+    await _seed_primary_usage(healthy_account_id, 10.0)
+    await _seed_secondary_usage(healthy_account_id, 10.0)
+    await _create_platform_identity(async_client, monkeypatch)
+
+    async def fail_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, payload, api_key, organization, project
+        raise AssertionError("a healthy ChatGPT candidate must keep backend compact on ChatGPT")
+
+    async def fake_chatgpt_compact(payload, headers, access_token, account_id):
+        del headers, access_token
+        assert payload.model == "gpt-5.1"
+        assert account_id == "acc_backend_compact_pool_healthy"
+        return CompactResponsePayload.model_validate(
+            {
+                "object": "response.compaction",
+                "status": "completed",
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                "output": [],
+            }
+        )
+
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fail_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fake_chatgpt_compact)
+
+    response = await async_client.post(
+        "/backend-api/codex/responses/compact",
+        json={"model": "gpt-5.1", "instructions": "compact", "input": []},
+    )
+    assert response.status_code == 200
+    assert response.json()["object"] == "response.compaction"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "chatgpt_web"
+    assert log.account_id == healthy_account_id
+    assert log.route_class == "chatgpt_private"
+
+
+@pytest.mark.asyncio
+async def test_backend_codex_compact_falls_back_to_platform_when_sticky_chatgpt_session_is_still_rate_limited(
+    async_client,
+    monkeypatch,
+):
+    sticky_account_id = await _import_account(
+        async_client,
+        "acc_backend_compact_sticky_blocked",
+        "backend-compact-sticky-blocked@example.com",
+    )
+    await _seed_primary_usage(sticky_account_id, 10.0)
+    await _seed_secondary_usage(sticky_account_id, 10.0)
+    await _set_account_status(sticky_account_id, status=AccountStatus.RATE_LIMITED, reset_after_seconds=300)
+    drained_account_id = await _import_account(
+        async_client,
+        "acc_backend_compact_sticky_blocked_drained",
+        "backend-compact-sticky-blocked-drained@example.com",
+    )
+    await _seed_primary_usage(drained_account_id, 95.0)
+    await _seed_secondary_usage(drained_account_id, 95.0)
+    identity_id = await _create_platform_identity(async_client, monkeypatch)
+
+    session_key = "backend-compact-session-sticky-blocked"
+    async with SessionLocal() as session:
+        session.add(
+            StickySession(
+                key=session_key,
+                kind=StickySessionKind.CODEX_SESSION,
+                provider_kind="chatgpt_web",
+                routing_subject_id=sticky_account_id,
+                account_id=sticky_account_id,
+            )
+        )
+        await session.commit()
+
+    async def fake_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, api_key, organization, project
+        assert payload["model"] == "gpt-5.1"
+        assert payload["instructions"] == "compact"
+        assert payload["input"] == []
+        return PlatformCompactResponseResult(
+            payload=CompactResponsePayload.model_validate(
+                {
+                    "object": "response.compaction",
+                    "status": "completed",
+                    "usage": {"input_tokens": 4, "output_tokens": 5, "total_tokens": 9},
+                    "output": [],
+                }
+            ),
+            upstream_request_id="up_req_backend_compact_sticky_blocked_fallback",
+        )
+
+    async def fail_chatgpt_compact(_payload, _headers, _access_token, _account_id):
+        raise AssertionError("sticky session outside grace must not suppress platform compact fallback")
+
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fake_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fail_chatgpt_compact)
+
+    response = await async_client.post(
+        "/backend-api/codex/responses/compact",
+        headers={"session_id": session_key},
+        json={"model": "gpt-5.1", "instructions": "compact", "input": []},
+    )
+    assert response.status_code == 200
+    assert response.json()["object"] == "response.compaction"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "openai_platform"
+    assert log.routing_subject_id == identity_id
+    assert log.route_class == "chatgpt_private"
+    assert log.upstream_request_id == "up_req_backend_compact_sticky_blocked_fallback"
+
+
+@pytest.mark.asyncio
+async def test_backend_codex_compact_falls_back_to_platform_when_secondary_usage_is_depleted(async_client, monkeypatch):
+    account_id = await _import_account(
+        async_client,
+        "acc_backend_compact_secondary_fallback",
+        "backend-compact-secondary@example.com",
+    )
+    await _seed_primary_usage(account_id, 10.0)
+    await _seed_secondary_usage(account_id, 95.0)
+    identity_id = await _create_platform_identity(async_client, monkeypatch)
+
+    async def fake_create_platform_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, api_key, organization, project
+        assert payload["model"] == "gpt-5.1"
+        assert payload["instructions"] == "compact"
+        assert payload["input"] == []
+        return PlatformCompactResponseResult(
+            payload=CompactResponsePayload.model_validate(
+                {
+                    "object": "response.compaction",
+                    "status": "completed",
+                    "usage": {"input_tokens": 4, "output_tokens": 5, "total_tokens": 9},
+                    "output": [],
+                }
+            ),
+            upstream_request_id="up_req_backend_compact_secondary_fallback",
+        )
+
+    async def fail_chatgpt_compact(_payload, _headers, _access_token, _account_id):
+        raise AssertionError("secondary-drained backend compact fallback should bypass ChatGPT compact transport")
+
+    monkeypatch.setattr(
+        provider_adapters_module,
+        "create_platform_compact_response",
+        fake_create_platform_compact_response,
+    )
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fail_chatgpt_compact)
+
+    response = await async_client.post(
+        "/backend-api/codex/responses/compact",
+        json={"model": "gpt-5.1", "instructions": "compact", "input": []},
+    )
+    assert response.status_code == 200
+    assert response.json()["object"] == "response.compaction"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "openai_platform"
+    assert log.routing_subject_id == identity_id
+    assert log.route_class == "chatgpt_private"
+    assert log.upstream_request_id == "up_req_backend_compact_secondary_fallback"
 
 
 @pytest.mark.parametrize(
@@ -1666,3 +2453,102 @@ async def test_backend_codex_responses_rejects_continuity_when_only_platform(asy
     payload = response.json()
     assert payload["error"]["code"] == "provider_continuity_unsupported"
     assert payload["error"]["param"] == "previous_response_id"
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_invalid_payload_persists_request_log(async_client):
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.1", "messages": [{"role": "tool", "content": "hi"}]},
+    )
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["error"]["code"] == "invalid_request_error"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind is None
+    assert log.route_class == "openai_public_http"
+    assert log.rejection_reason == "invalid_responses_payload"
+    assert log.error_code == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_v1_compact_invalid_payload_persists_request_log(async_client):
+    response = await async_client.post(
+        "/v1/responses/compact",
+        json={"model": "gpt-5.1", "messages": [{"role": "tool", "content": "hi"}]},
+    )
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["error"]["code"] == "invalid_request_error"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind is None
+    assert log.route_class == "openai_public_http"
+    assert log.rejection_reason == "invalid_compact_payload"
+    assert log.error_code == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_platform_auth_failure_persists_request_log(async_client, monkeypatch):
+    account_id = await _import_account(async_client, "acc_resp_auth_fail", "resp-auth-fail@example.com")
+    await _seed_primary_usage(account_id, 95.0)
+    identity_id = await _create_platform_identity(async_client, monkeypatch, route_families=["public_responses_http"])
+
+    async def fail_create_platform_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, payload, api_key, organization, project
+        raise OpenAIPlatformError(
+            401,
+            {
+                "error": {
+                    "code": "invalid_api_key",
+                    "message": "Invalid API key",
+                }
+            },
+        )
+
+    monkeypatch.setattr(provider_adapters_module, "create_platform_response", fail_create_platform_response)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.1", "input": "hi"},
+    )
+    assert response.status_code == 401
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "openai_platform"
+    assert log.routing_subject_id == identity_id
+    assert log.route_class == "openai_public_http"
+    assert log.rejection_reason == "platform_response_request_failed"
+    assert log.error_code == "invalid_api_key"
+
+
+@pytest.mark.asyncio
+async def test_v1_compact_not_implemented_persists_a_single_request_log(async_client, monkeypatch):
+    account_id = await _import_account(async_client, "acc_v1_compact_not_impl", "v1-compact-not-impl@example.com")
+    await _seed_primary_usage(account_id, 10.0)
+    await _seed_secondary_usage(account_id, 10.0)
+    before_count = await _request_log_count()
+
+    async def fail_chatgpt_compact(_payload, _headers, _access_token, _account_id):
+        raise NotImplementedError("compact transport unavailable in test")
+
+    monkeypatch.setattr(provider_adapters_module, "core_compact_responses", fail_chatgpt_compact)
+
+    response = await async_client.post("/v1/responses/compact", json={"model": "gpt-5.1", "input": "hi"})
+    assert response.status_code == 501
+    payload = response.json()
+    assert payload["error"]["code"] == "not_implemented"
+
+    after_count = await _request_log_count()
+    assert after_count == before_count + 1
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "chatgpt_web"
+    assert log.route_class == "openai_public_http"
+    assert log.rejection_reason == "provider_compact_not_implemented"
+    assert log.error_code == "not_implemented"

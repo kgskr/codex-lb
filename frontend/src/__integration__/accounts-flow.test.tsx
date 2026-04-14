@@ -57,7 +57,6 @@ describe("accounts flow integration", () => {
     const dialog = await screen.findByRole("dialog", { name: "Edit OpenAI Platform API key" });
     await user.clear(within(dialog).getByLabelText("Label"));
     await user.type(within(dialog).getByLabelText("Label"), "Platform Renamed");
-    await user.click(within(dialog).getAllByRole("checkbox")[0]);
     await user.click(within(dialog).getByRole("button", { name: "Save changes" }));
 
     await waitFor(() => {

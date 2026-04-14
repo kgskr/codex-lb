@@ -2,7 +2,6 @@ import { useMemo, useState } from "react";
 import type { FormEvent } from "react";
 
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -13,17 +12,10 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  PLATFORM_ROUTE_FAMILY_ORDER,
-  PLATFORM_ROUTE_OPTIONS,
-  shouldIncludeRouteFamily,
-  type CheckedState,
-} from "@/features/accounts/components/platform-identity-route-options";
 import type {
   AccountSummary,
   PlatformIdentityCreateRequest,
   PlatformIdentityUpdateRequest,
-  PlatformRouteFamily,
 } from "@/features/accounts/schemas";
 
 function normalizeOptionalText(value: string): string | null {
@@ -31,24 +23,11 @@ function normalizeOptionalText(value: string): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function normalizeEligibleRouteFamilies(value: PlatformRouteFamily[]): PlatformRouteFamily[] {
-  const next = new Set(value);
-  return PLATFORM_ROUTE_FAMILY_ORDER.filter((routeFamily) => next.has(routeFamily));
-}
-
-function areRouteFamiliesEqual(left: PlatformRouteFamily[], right: PlatformRouteFamily[]): boolean {
-  if (left.length !== right.length) {
-    return false;
-  }
-  return left.every((value, index) => value === right[index]);
-}
-
 type PlatformIdentityFormState = {
   label: string;
   apiKey: string;
   organization: string;
   project: string;
-  eligibleRouteFamilies: PlatformRouteFamily[];
 };
 
 function createPlatformIdentityFormState({
@@ -56,13 +35,11 @@ function createPlatformIdentityFormState({
   label,
   organization,
   project,
-  eligibleRouteFamilies,
 }: {
   isEdit: boolean;
   label: string;
   organization: string | null;
   project: string | null;
-  eligibleRouteFamilies: PlatformRouteFamily[];
 }): PlatformIdentityFormState {
   if (!isEdit) {
     return {
@@ -70,7 +47,6 @@ function createPlatformIdentityFormState({
       apiKey: "",
       organization: "",
       project: "",
-      eligibleRouteFamilies: [],
     };
   }
   return {
@@ -78,7 +54,6 @@ function createPlatformIdentityFormState({
     apiKey: "",
     organization: organization ?? "",
     project: project ?? "",
-    eligibleRouteFamilies,
   };
 }
 
@@ -109,10 +84,6 @@ export function PlatformIdentityDialog({
   const initialLabel = account ? account.label ?? account.displayName ?? account.email : "";
   const initialOrganization = account?.organization ?? null;
   const initialProject = account?.project ?? null;
-  const initialEligibleRouteFamilies = useMemo(
-    () => normalizeEligibleRouteFamilies(account?.eligibleRouteFamilies ?? []),
-    [account?.eligibleRouteFamilies],
-  );
 
   const handleOpenChange = (nextOpen: boolean) => {
     onOpenChange(nextOpen);
@@ -124,7 +95,6 @@ export function PlatformIdentityDialog({
     initialLabel,
     initialOrganization ?? "",
     initialProject ?? "",
-    initialEligibleRouteFamilies.join(","),
   ].join(":");
 
   return (
@@ -135,15 +105,15 @@ export function PlatformIdentityDialog({
           <DialogDescription>
             {isEdit ? (
               <>
-                Update the fallback-only upstream identity for the enabled HTTP fallback routes. ChatGPT accounts stay
-                primary, and this key is used only when the compatible ChatGPT pool is unhealthy under the primary or
-                secondary drain thresholds.
+                Update the fallback-only upstream identity for the full supported HTTP fallback scope. ChatGPT accounts
+                stay primary, and this key is used only when the compatible ChatGPT pool is unhealthy under the
+                primary or secondary drain thresholds.
               </>
             ) : (
               <>
-                Register a fallback-only upstream identity for the enabled HTTP fallback routes. ChatGPT accounts stay
-                primary, and this key is used only when the compatible ChatGPT pool is unhealthy under the primary or
-                secondary drain thresholds.
+                Register a fallback-only upstream identity for the full supported HTTP fallback scope. ChatGPT
+                accounts stay primary, and this key is used only when the compatible ChatGPT pool is unhealthy under
+                the primary or secondary drain thresholds.
               </>
             )}
           </DialogDescription>
@@ -159,7 +129,6 @@ export function PlatformIdentityDialog({
             initialLabel={initialLabel}
             initialOrganization={initialOrganization}
             initialProject={initialProject}
-            initialEligibleRouteFamilies={initialEligibleRouteFamilies}
             onOpenChange={onOpenChange}
             onSubmit={onSubmit}
           />
@@ -178,7 +147,6 @@ type PlatformIdentityDialogFormProps = {
   initialLabel: string;
   initialOrganization: string | null;
   initialProject: string | null;
-  initialEligibleRouteFamilies: PlatformRouteFamily[];
   onOpenChange: (open: boolean) => void;
   onSubmit: (
     payload: PlatformIdentityCreateRequest | PlatformIdentityUpdateRequest,
@@ -194,7 +162,6 @@ function PlatformIdentityDialogForm({
   initialLabel,
   initialOrganization,
   initialProject,
-  initialEligibleRouteFamilies,
   onOpenChange,
   onSubmit,
 }: PlatformIdentityDialogFormProps) {
@@ -205,10 +172,9 @@ function PlatformIdentityDialogForm({
       label: initialLabel,
       organization: initialOrganization,
       project: initialProject,
-      eligibleRouteFamilies: initialEligibleRouteFamilies,
     }),
   );
-  const { label, apiKey, organization, project, eligibleRouteFamilies } = formState;
+  const { label, apiKey, organization, project } = formState;
 
   const resetForm = () => {
     setFormState(
@@ -217,7 +183,6 @@ function PlatformIdentityDialogForm({
         label: initialLabel,
         organization: initialOrganization,
         project: initialProject,
-        eligibleRouteFamilies: initialEligibleRouteFamilies,
       }),
     );
   };
@@ -229,19 +194,15 @@ function PlatformIdentityDialogForm({
     const nextLabel = label.trim();
     const nextOrganization = normalizeOptionalText(organization);
     const nextProject = normalizeOptionalText(project);
-    const nextEligibleRouteFamilies = normalizeEligibleRouteFamilies(eligibleRouteFamilies);
     return (
       nextLabel !== initialLabel ||
       apiKey.trim().length > 0 ||
       nextOrganization !== initialOrganization ||
-      nextProject !== initialProject ||
-      !areRouteFamiliesEqual(nextEligibleRouteFamilies, initialEligibleRouteFamilies)
+      nextProject !== initialProject
     );
   }, [
     account,
     apiKey,
-    eligibleRouteFamilies,
-    initialEligibleRouteFamilies,
     initialLabel,
     initialOrganization,
     initialProject,
@@ -265,21 +226,6 @@ function PlatformIdentityDialogForm({
     setFormState((current) => ({ ...current, [key]: value }));
   };
 
-  const handleRouteToggle = (routeFamily: PlatformRouteFamily, checked: CheckedState) => {
-    setFormState((current) => {
-      const next = new Set(current.eligibleRouteFamilies);
-      if (shouldIncludeRouteFamily(checked)) {
-        next.add(routeFamily);
-      } else {
-        next.delete(routeFamily);
-      }
-      return {
-        ...current,
-        eligibleRouteFamilies: PLATFORM_ROUTE_FAMILY_ORDER.filter((value) => next.has(value)),
-      };
-    });
-  };
-
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!canSubmit) {
@@ -290,7 +236,6 @@ function PlatformIdentityDialogForm({
       const nextLabel = label.trim();
       const nextOrganization = normalizeOptionalText(organization);
       const nextProject = normalizeOptionalText(project);
-      const nextEligibleRouteFamilies = normalizeEligibleRouteFamilies(eligibleRouteFamilies);
 
       if (nextLabel !== initialLabel) {
         payload.label = nextLabel;
@@ -304,9 +249,6 @@ function PlatformIdentityDialogForm({
       if (nextProject !== initialProject) {
         payload.project = nextProject;
       }
-      if (!areRouteFamiliesEqual(nextEligibleRouteFamilies, initialEligibleRouteFamilies)) {
-        payload.eligibleRouteFamilies = nextEligibleRouteFamilies;
-      }
       await onSubmit(payload);
     } else {
       await onSubmit({
@@ -314,7 +256,6 @@ function PlatformIdentityDialogForm({
         apiKey,
         organization,
         project,
-        eligibleRouteFamilies,
       });
     }
     resetForm();
@@ -371,39 +312,21 @@ function PlatformIdentityDialogForm({
       </div>
 
       <div className="space-y-2">
-        <Label>Eligible routes</Label>
-        <div className="space-y-2 rounded-lg border bg-muted/20 p-3">
-          {PLATFORM_ROUTE_OPTIONS.map((option) => (
-            <label key={option.value} className="flex items-start gap-3 rounded-md px-1 py-1.5">
-              <Checkbox
-                checked={eligibleRouteFamilies.includes(option.value)}
-                onCheckedChange={(checked) => handleRouteToggle(option.value, checked)}
-              />
-              <span className="min-w-0">
-                <span className="block text-sm font-medium">{option.label}</span>
-                <span className="block text-xs text-muted-foreground">
-                  {option.description}
-                  {option.value === "public_responses_http"
-                    ? " Stateless HTTP only; compact, chat completions, websocket, and continuity-bound requests stay on ChatGPT."
-                    : option.value === "backend_codex_http"
-                    ? " Compact, websocket, and continuity-bound Codex requests stay on ChatGPT."
-                    : ""}
-                </span>
-              </span>
-            </label>
-          ))}
+        <Label>Fallback scope</Label>
+        <div className="rounded-lg border bg-muted/20 p-3 text-xs text-muted-foreground">
+          <p>All supported fallback paths are enabled automatically for this key.</p>
+          <p className="mt-2">
+            It can back <code>/v1/models</code>, stateless HTTP <code>/v1/responses</code>, stateless HTTP{" "}
+            <code>/v1/responses/compact</code>, <code>/backend-api/codex/models</code>, stateless HTTP{" "}
+            <code>/backend-api/codex/responses</code>, and stateless HTTP{" "}
+            <code>/backend-api/codex/responses/compact</code>.
+          </p>
+          <p className="mt-2">Websocket and continuity-bound requests stay on ChatGPT.</p>
         </div>
         <p className="text-xs text-muted-foreground">
-          {eligibleRouteFamilies.length === 0
-            ? "No route families enabled. This identity stays unroutable until you opt into one."
-            : `Enabled for ${eligibleRouteFamilies.length} route ${
-                eligibleRouteFamilies.length === 1 ? "family" : "families"
-              }.`}
-        </p>
-        <p className="text-xs text-muted-foreground">
           {isEdit
-            ? "This key can back /v1/models, stateless HTTP /v1/responses, /backend-api/codex/models, and stateless HTTP /backend-api/codex/responses only when the matching route families are enabled. Compact, websocket, and continuity-bound requests stay on ChatGPT."
-            : "Requires an existing ChatGPT account that is not paused or deactivated. Only one Platform API key can be registered, and it is used only as fallback for enabled /v1/models, stateless /v1/responses, /backend-api/codex/models, and stateless /backend-api/codex/responses routes."}
+            ? "Path selection is no longer configurable. This key always covers the full supported fallback scope."
+            : "Requires an existing ChatGPT account that is not paused or deactivated. Only one Platform API key can be registered, and it is used only as fallback behind the ChatGPT pool."}
         </p>
         {!isEdit && !prerequisiteSatisfied ? (
           <p className="text-xs text-destructive">

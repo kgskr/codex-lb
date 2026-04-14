@@ -337,6 +337,9 @@ class ProxyResponseError(Exception):
         failure_detail: str | None = None,
         failure_exception_type: str | None = None,
         upstream_status_code: int | None = None,
+        upstream_request_id: str | None = None,
+        provider_kind: str | None = None,
+        routing_subject_id: str | None = None,
     ) -> None:
         super().__init__(f"Proxy response error ({status_code})")
         self.status_code = status_code
@@ -346,6 +349,9 @@ class ProxyResponseError(Exception):
         self.failure_detail = failure_detail
         self.failure_exception_type = failure_exception_type
         self.upstream_status_code = upstream_status_code
+        self.upstream_request_id = upstream_request_id
+        self.provider_kind = provider_kind
+        self.routing_subject_id = routing_subject_id
 
 
 def _should_drop_inbound_header(name: str) -> bool:
@@ -698,6 +704,17 @@ def _effective_compact_total_timeout(configured_timeout_seconds: float | None) -
     if override is None:
         return configured_timeout_seconds
     return max(0.001, min(configured_timeout_seconds, override))
+
+
+def current_compact_timeout_settings(
+    *,
+    configured_connect_timeout_seconds: float,
+    configured_total_timeout_seconds: float | None,
+) -> tuple[float, float | None]:
+    return (
+        _effective_compact_connect_timeout(configured_connect_timeout_seconds),
+        _effective_compact_total_timeout(configured_total_timeout_seconds),
+    )
 
 
 def _effective_transcribe_connect_timeout(configured_timeout_seconds: float) -> float:
@@ -1332,6 +1349,8 @@ async def _inline_input_image_urls(
     payload: JsonObject,
     session: "ImageFetchSession",
     connect_timeout: float,
+    *,
+    deadline: float | None = None,
 ) -> dict[str, JsonValue]:
     payload_dict = dict(payload)
     input_value = payload_dict.get("input")
@@ -1344,7 +1363,12 @@ async def _inline_input_image_urls(
             updated_input.append(item)
             continue
         content = item.get("content")
-        updated_content, content_changed = await _inline_content_images(content, session, connect_timeout)
+        updated_content, content_changed = await _inline_content_images(
+            content,
+            session,
+            connect_timeout,
+            deadline=deadline,
+        )
         if content_changed:
             new_item = dict(item)
             new_item["content"] = updated_content
@@ -1362,6 +1386,8 @@ async def _inline_content_images(
     content: JsonValue,
     session: "ImageFetchSession",
     connect_timeout: float,
+    *,
+    deadline: float | None = None,
 ) -> tuple[JsonValue, bool]:
     if content is None:
         return content, False
@@ -1375,7 +1401,12 @@ async def _inline_content_images(
         part_type = part.get("type")
         image_url = part.get("image_url") if part_type == "input_image" else None
         if isinstance(image_url, str) and image_url.startswith(("http://", "https://")):
-            data_url = await _fetch_image_data_url(session, image_url, connect_timeout)
+            data_url = await _fetch_image_data_url(
+                session,
+                image_url,
+                connect_timeout,
+                deadline=deadline,
+            )
             if data_url:
                 new_part = dict(part)
                 new_part["image_url"] = data_url
@@ -1392,17 +1423,30 @@ async def _fetch_image_data_url(
     session: "ImageFetchSession",
     image_url: str,
     connect_timeout: float,
+    *,
+    deadline: float | None = None,
 ) -> str | None:
-    target = await _resolve_safe_image_fetch_target(image_url, connect_timeout=connect_timeout)
+    target = await _resolve_safe_image_fetch_target(
+        image_url,
+        connect_timeout=connect_timeout,
+        deadline=deadline,
+    )
     if target is None:
         return None
-    timeout = aiohttp.ClientTimeout(
-        total=_IMAGE_INLINE_TIMEOUT_SECONDS,
-        sock_connect=connect_timeout,
-        sock_read=_IMAGE_INLINE_TIMEOUT_SECONDS,
-    )
     headers = {"Host": target.host_header}
     for request_url in target.request_urls:
+        if deadline is not None:
+            remaining_total_timeout = deadline - time.monotonic()
+            if remaining_total_timeout <= 0:
+                return None
+            fetch_total_timeout = min(_IMAGE_INLINE_TIMEOUT_SECONDS, max(0.001, remaining_total_timeout))
+        else:
+            fetch_total_timeout = _IMAGE_INLINE_TIMEOUT_SECONDS
+        timeout = aiohttp.ClientTimeout(
+            total=fetch_total_timeout,
+            sock_connect=min(connect_timeout, fetch_total_timeout),
+            sock_read=fetch_total_timeout,
+        )
         try:
             async with session.get(
                 request_url,
@@ -1455,6 +1499,7 @@ async def _resolve_safe_image_fetch_target(
     url: str,
     *,
     connect_timeout: float,
+    deadline: float | None = None,
 ) -> SafeImageFetchTarget | None:
     settings = get_settings()
     if not settings.image_inline_fetch_enabled:
@@ -1485,6 +1530,11 @@ async def _resolve_safe_image_fetch_target(
         resolved_ips = [literal_ip.compressed]
     else:
         resolve_timeout = min(connect_timeout, _IMAGE_INLINE_TIMEOUT_SECONDS)
+        if deadline is not None:
+            remaining_total_timeout = deadline - time.monotonic()
+            if remaining_total_timeout <= 0:
+                return None
+            resolve_timeout = min(resolve_timeout, max(0.001, remaining_total_timeout))
         resolved_ips = await _resolve_global_ips(host, timeout_seconds=resolve_timeout)
         if not resolved_ips:
             return None
@@ -1591,6 +1641,28 @@ class ImageFetchSession(Protocol):
 
 def _as_image_fetch_session(session: aiohttp.ClientSession) -> ImageFetchSession:
     return cast(ImageFetchSession, session)
+
+
+def as_image_fetch_session(session: aiohttp.ClientSession) -> ImageFetchSession:
+    return _as_image_fetch_session(session)
+
+
+async def maybe_inline_payload_input_images(
+    payload: JsonObject,
+    *,
+    session: ImageFetchSession,
+    connect_timeout: float,
+    total_timeout: float | None = None,
+) -> JsonObject:
+    if not get_settings().image_inline_fetch_enabled:
+        return dict(payload)
+    deadline = None if total_timeout is None else time.monotonic() + total_timeout
+    return await _inline_input_image_urls(
+        dict(payload),
+        session,
+        connect_timeout,
+        deadline=deadline,
+    )
 
 
 async def stream_responses(
@@ -2017,12 +2089,12 @@ class _CompactCommandTransport:
         compact_timeout_seconds = _effective_compact_total_timeout(settings.upstream_compact_timeout_seconds)
         effective_connect_timeout = _effective_compact_connect_timeout(settings.upstream_connect_timeout_seconds)
         payload_dict = _normalize_chatgpt_web_payload(self.payload.to_payload())
-        if settings.image_inline_fetch_enabled:
-            payload_dict = await _inline_input_image_urls(
-                payload_dict,
-                _as_image_fetch_session(self.session),
-                effective_connect_timeout,
-            )
+        payload_dict = await maybe_inline_payload_input_images(
+            payload_dict,
+            session=as_image_fetch_session(self.session),
+            connect_timeout=effective_connect_timeout,
+            total_timeout=compact_timeout_seconds,
+        )
         now = time.monotonic()
         compact_timeout_seconds = _remaining_total_timeout(
             compact_timeout_seconds,
