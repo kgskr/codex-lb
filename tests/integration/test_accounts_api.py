@@ -19,14 +19,16 @@ from app.modules.upstream_identities.repository import (
     OpenAIPlatformIdentityCreate,
     split_route_families,
 )
+from app.modules.upstream_identities.types import PlatformRouteFamily
 
 pytestmark = pytest.mark.integration
 
-EXPECTED_PLATFORM_ROUTE_FAMILIES = [
+EXPECTED_PLATFORM_ROUTE_FAMILY_TUPLE: tuple[PlatformRouteFamily, ...] = (
     "backend_codex_http",
     "public_models_http",
     "public_responses_http",
-]
+)
+EXPECTED_PLATFORM_ROUTE_FAMILIES = list(EXPECTED_PLATFORM_ROUTE_FAMILY_TUPLE)
 
 
 def _encode_jwt(payload: dict) -> str:
@@ -736,7 +738,7 @@ async def test_platform_identity_repository_enforces_singleton(async_client):
             api_key_encrypted=b"encrypted-1",
             organization_id=None,
             project_id=None,
-            eligible_route_families=tuple(EXPECTED_PLATFORM_ROUTE_FAMILIES),
+            eligible_route_families=EXPECTED_PLATFORM_ROUTE_FAMILY_TUPLE,
             status=AccountStatus.ACTIVE,
             last_validated_at=None,
             last_auth_failure_reason=None,
@@ -747,7 +749,7 @@ async def test_platform_identity_repository_enforces_singleton(async_client):
             api_key_encrypted=b"encrypted-2",
             organization_id=None,
             project_id=None,
-            eligible_route_families=tuple(EXPECTED_PLATFORM_ROUTE_FAMILIES),
+            eligible_route_families=EXPECTED_PLATFORM_ROUTE_FAMILY_TUPLE,
             status=AccountStatus.ACTIVE,
             last_validated_at=None,
             last_auth_failure_reason=None,

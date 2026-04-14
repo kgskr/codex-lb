@@ -15,6 +15,12 @@ The `/project-conventions` skill is auto-activated on code edits (PreToolUse gua
 | Code Conventions (Full) | `/project-conventions` skill | On code edit (auto-enforced) |
 | Git Workflow | `.agents/conventions/git-workflow.md` | Commit / PR |
 
+## Push Validation
+
+- Before `git push`, run the relevant local CI-equivalent checks for the files and workflows you changed. Typical examples are `ruff`, `ty`, targeted `pytest`, and frontend `vitest`/coverage runs when frontend code changed.
+- Treat local test execution as the push gate. If the host environment is insufficient, use `podman` to run the tests locally.
+- Do **not** require a container image build as part of the default push validation flow. Container builds are excluded unless the change specifically targets container packaging or runtime image behavior.
+
 ## Workflow (OpenSpec-first)
 
 This repo uses **OpenSpec as the primary workflow and SSOT** for change-driven development.

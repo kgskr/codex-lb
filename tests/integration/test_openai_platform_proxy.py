@@ -31,15 +31,17 @@ from app.core.openai.models import CompactResponsePayload, OpenAIResponsePayload
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, OpenAIPlatformIdentity, RequestLog, StickySession, StickySessionKind
 from app.db.session import SessionLocal
+from app.modules.upstream_identities.types import PlatformRouteFamily
 from app.modules.usage.repository import UsageRepository
 
 pytestmark = pytest.mark.integration
 
-EXPECTED_PLATFORM_ROUTE_FAMILIES = [
+EXPECTED_PLATFORM_ROUTE_FAMILY_TUPLE: tuple[PlatformRouteFamily, ...] = (
     "backend_codex_http",
     "public_models_http",
     "public_responses_http",
-]
+)
+EXPECTED_PLATFORM_ROUTE_FAMILIES = list(EXPECTED_PLATFORM_ROUTE_FAMILY_TUPLE)
 
 
 def _make_upstream_model(slug: str) -> UpstreamModel:
@@ -1501,7 +1503,7 @@ async def test_v1_compact_retries_with_next_platform_identity_after_auth_failure
     )
     original_get_by_id = platform_repository_module.OpenAIPlatformIdentitiesRepository.get_by_id
 
-    async def fake_list_eligible_identities(self, route_family: str):
+    async def fake_list_eligible_identities(self, route_family: PlatformRouteFamily):
         identities = await original_list_eligible_identities(self, route_family)
         return [*identities, second_identity]
 
@@ -1663,7 +1665,7 @@ async def test_backend_codex_compact_retries_with_next_platform_identity_after_a
     )
     original_get_by_id = platform_repository_module.OpenAIPlatformIdentitiesRepository.get_by_id
 
-    async def fake_list_eligible_identities(self, route_family: str):
+    async def fake_list_eligible_identities(self, route_family: PlatformRouteFamily):
         identities = await original_list_eligible_identities(self, route_family)
         return [*identities, second_identity]
 

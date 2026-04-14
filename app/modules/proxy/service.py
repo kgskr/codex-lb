@@ -1325,7 +1325,7 @@ class ProxyService:
                         )
                         raise ProxyResponseError(
                             exc.status_code,
-                            exc.payload,
+                            cast(OpenAIErrorEnvelope, exc.payload),
                             upstream_request_id=exc.upstream_request_id,
                             provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
                             routing_subject_id=current_identity.id,

@@ -30,11 +30,12 @@ describe("PlatformIdentityDialog", () => {
 
     expect(screen.getByText(/Register a fallback-only upstream identity for/i)).toBeInTheDocument();
     expect(screen.getByText("All supported fallback paths are enabled automatically for this key.")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        /It can back \/v1\/models, stateless HTTP \/v1\/responses, stateless HTTP \/v1\/responses\/compact/,
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByText("/v1/models")).toBeInTheDocument();
+    expect(screen.getByText("/v1/responses")).toBeInTheDocument();
+    expect(screen.getByText("/v1/responses/compact")).toBeInTheDocument();
+    expect(screen.getByText("/backend-api/codex/models")).toBeInTheDocument();
+    expect(screen.getByText("/backend-api/codex/responses")).toBeInTheDocument();
+    expect(screen.getByText("/backend-api/codex/responses/compact")).toBeInTheDocument();
     expect(
       screen.getByText("Websocket and continuity-bound requests stay on ChatGPT."),
     ).toBeInTheDocument();

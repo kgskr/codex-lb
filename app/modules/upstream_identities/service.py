@@ -22,6 +22,7 @@ from app.modules.upstream_identities.schemas import (
 from app.modules.upstream_identities.types import (
     OPENAI_PLATFORM_PROVIDER_KIND,
     PHASE1_PLATFORM_ROUTE_FAMILIES,
+    PlatformRouteFamily,
 )
 
 
@@ -169,7 +170,7 @@ class OpenAIPlatformIdentitiesService:
     def summarize_identity(self, identity: OpenAIPlatformIdentity) -> PlatformIdentitySummary:
         return self._to_summary(identity)
 
-    def _supported_route_families(self) -> tuple[str, ...]:
+    def _supported_route_families(self) -> tuple[PlatformRouteFamily, ...]:
         return normalize_route_families(PHASE1_PLATFORM_ROUTE_FAMILIES)
 
     def _to_summary(self, identity: OpenAIPlatformIdentity) -> PlatformIdentitySummary:

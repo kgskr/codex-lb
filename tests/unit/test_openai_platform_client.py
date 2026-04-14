@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -70,8 +71,8 @@ class _ResponseContext:
 class _FakeSession:
     def __init__(self, response: _FakeResponse) -> None:
         self._response = response
-        self.get_calls: list[dict[str, object]] = []
-        self.post_calls: list[dict[str, object]] = []
+        self.get_calls: list[dict[str, Any]] = []
+        self.post_calls: list[dict[str, Any]] = []
 
     def get(self, url: str, *, headers, timeout):
         self.get_calls.append(
@@ -98,7 +99,7 @@ class _FakeSession:
 class _ContextPostSession:
     def __init__(self, response: _FakeResponse) -> None:
         self._response = response
-        self.post_calls: list[dict[str, object]] = []
+        self.post_calls: list[dict[str, Any]] = []
 
     def post(self, url: str, *, headers, json, timeout):
         self.post_calls.append(
