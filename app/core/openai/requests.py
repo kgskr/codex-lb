@@ -18,13 +18,17 @@ _RESPONSES_INCLUDE_ALLOWLIST = {
     "web_search_call.action.sources",
 }
 
-UNSUPPORTED_TOOL_TYPES = {
-    "file_search",
-    "code_interpreter",
-    "computer_use",
-    "computer_use_preview",
-    "image_generation",
-}
+RESPONSES_UNSUPPORTED_TOOL_TYPES: frozenset[str] = frozenset()
+
+CHAT_UNSUPPORTED_TOOL_TYPES = frozenset(
+    {
+        "file_search",
+        "code_interpreter",
+        "computer_use",
+        "computer_use_preview",
+        "image_generation",
+    }
+)
 
 _TOOL_TYPE_ALIASES = {
     "web_search_preview": "web_search",
@@ -66,7 +70,11 @@ def normalize_tool_choice(choice: JsonValue | None) -> JsonValue | None:
     return choice
 
 
-def validate_tool_types(tools: list[JsonValue]) -> list[JsonValue]:
+def validate_tool_types(
+    tools: list[JsonValue],
+    *,
+    unsupported_tool_types: frozenset[str] = RESPONSES_UNSUPPORTED_TOOL_TYPES,
+) -> list[JsonValue]:
     normalized_tools: list[JsonValue] = []
     for tool in tools:
         if not is_json_mapping(tool):
@@ -80,7 +88,7 @@ def validate_tool_types(tools: list[JsonValue]) -> list[JsonValue]:
                 tool = dict(tool_mapping)
                 tool["type"] = normalized_type
                 tool_type = normalized_type
-            if tool_type in UNSUPPORTED_TOOL_TYPES:
+            if tool_type in unsupported_tool_types:
                 raise ValueError(f"Unsupported tool type: {tool_type}")
         normalized_tools.append(tool)
     return normalized_tools
