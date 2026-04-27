@@ -15,7 +15,10 @@ __pycache__/
 .vscode/
 .idea/
 node_modules/
+**/node_modules/
 coverage/
+**/coverage/
+frontend/screenshots/
 dist/
 build/
 htmlcov/

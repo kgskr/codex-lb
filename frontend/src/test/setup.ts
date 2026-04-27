@@ -25,6 +25,24 @@ if (typeof document !== "undefined" && typeof document.elementFromPoint !== "fun
   document.elementFromPoint = () => null;
 }
 
+if (typeof HTMLCanvasElement !== "undefined") {
+  Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
+    configurable: true,
+    value: vi.fn((contextId: string) => {
+      if (contextId !== "2d") return null;
+      let fillStyle = "#000000";
+      return {
+        get fillStyle() {
+          return fillStyle;
+        },
+        set fillStyle(value: string) {
+          fillStyle = value || "#000000";
+        },
+      };
+    }),
+  });
+}
+
 if (typeof globalThis.ResizeObserver === "undefined") {
   class ResizeObserverMock {
     observe() {}

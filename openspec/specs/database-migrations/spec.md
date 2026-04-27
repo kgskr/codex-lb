@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define codex-lb database migration behavior so schema upgrades are deterministic, operationally safe, and CI-enforced under Alembic.
+See context docs for background.
 
 ## Requirements
 
@@ -38,82 +38,25 @@ After startup migrations report success, the system SHALL verify that the live d
 - **THEN** the system logs the drift details as an error
 - **AND** it does not silently suppress the drift context
 
-### Requirement: Legacy migration history bootstrap
+### Requirement: Legacy revision remap preserves downstream migrations
 
-The system SHALL automatically bootstrap legacy `schema_migrations` history into Alembic revision state when `alembic_version` is missing.
+Known legacy Alembic revision IDs SHALL be remapped to a valid current revision without marking any newer current migration as already applied unless that migration's schema changes are guaranteed to exist in the database.
 
-#### Scenario: Legacy history exists
+#### Scenario: Legacy import-default revision still applies bridge migrations
 
-- **GIVEN** `schema_migrations` exists and `alembic_version` does not exist
-- **WHEN** startup migration runs
-- **THEN** the system stamps the highest contiguous known legacy revision
-- **AND** continues with Alembic upgrade to `head`
+- **GIVEN** a database records legacy revision `20260410_020000_restore_import_without_overwrite_default_false`
+- **AND** durable HTTP bridge tables are not present yet
+- **WHEN** startup auto-remaps the legacy revision and upgrades to head
+- **THEN** the upgrade path still applies the durable HTTP bridge migrations
+- **AND** the database contains `http_bridge_sessions` and `http_bridge_session_aliases`
 
-### Requirement: Automatic remap for legacy Alembic revision IDs
+### Requirement: Compatibility downgrades preserve preexisting columns
 
-The system SHALL automatically remap known legacy Alembic revision IDs in `alembic_version` to timestamp-based revision IDs before migration upgrade.
+Downgrades for additive compatibility migrations SHALL remove indexes or constraints introduced by that migration without dropping nullable columns that may have existed before the migration ran.
 
-#### Scenario: Startup sees known legacy Alembic revision IDs
+#### Scenario: Request log session id survives response lookup downgrade
 
-- **WHEN** startup migration finds known legacy IDs in `alembic_version`
-- **THEN** it replaces them with mapped timestamp-based revision IDs
-- **AND** proceeds with Alembic upgrade to `head`
-
-#### Scenario: Startup sees unsupported Alembic revision ID
-
-- **WHEN** startup migration finds IDs that are neither current revisions nor known legacy IDs
-- **THEN** it fails fast with an explicit error requiring operator intervention
-
-### Requirement: Alembic revision naming policy
-
-All Alembic revision IDs SHALL match `^\d{8}_\d{6}_[a-z0-9_]+$` and each migration filename SHALL be `<revision>.py`.
-
-#### Scenario: Migration policy check validates naming
-
-- **WHEN** migration policy checks run
-- **THEN** every revision ID matches the timestamp-based naming format
-- **AND** every migration filename matches its revision ID
-
-### Requirement: Single-head convergence at merge gate
-
-The project SHALL converge to a single Alembic head at merge/release gates.
-
-#### Scenario: Policy check detects multiple heads
-
-- **WHEN** migration policy check evaluates the revision graph
-- **THEN** it fails if more than one head exists
-- **AND** requires a merge revision before merge/release
-
-### Requirement: Idempotent migration behavior across DB states
-
-The migration chain SHALL be idempotent for fresh databases and partially migrated legacy databases.
-
-#### Scenario: Migration rerun
-
-- **WHEN** startup migration runs repeatedly on the same database
-- **THEN** schema state remains stable
-- **AND** the current Alembic revision remains `head`
-
-### Requirement: Automatic SQLite pre-migration backup
-
-The system SHALL create a SQLite backup before applying startup migrations when an upgrade is needed.
-
-#### Scenario: Startup detects pending migration on SQLite
-
-- **GIVEN** the configured database is a SQLite file
-- **AND** startup migration is enabled
-- **AND** migration state indicates upgrade is required
-- **WHEN** startup migration begins
-- **THEN** the system creates a pre-migration backup file
-- **AND** enforces configured retention on backup files
-
-### Requirement: Migration policy and drift guard in CI
-
-The project SHALL fail CI when migration policy is violated or ORM metadata and migrated schema diverge.
-
-#### Scenario: CI migration check run
-
-- **WHEN** CI executes migration checks
-- **THEN** it upgrades a temporary database to `head`
-- **AND** runs a unified migration check command
-- **AND** fails if policy violations or drift are detected
+- **GIVEN** `request_logs.session_id` exists before the response lookup index migration is downgraded
+- **WHEN** the response lookup index migration is downgraded
+- **THEN** the migration drops its lookup indexes
+- **AND** it preserves `request_logs.session_id`

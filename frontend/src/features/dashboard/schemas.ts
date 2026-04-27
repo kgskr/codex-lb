@@ -1,4 +1,4 @@
-import { z } from "zod";
+import * as z from "zod";
 
 import {
   AccountAdditionalQuotaSchema,
@@ -107,6 +107,7 @@ export const DashboardOverviewSchema = z.object({
 export const RequestLogSchema = z.object({
   requestedAt: z.string().datetime({ offset: true }),
   accountId: z.string().nullable(),
+  planType: z.string().nullable().optional().default(null),
   apiKeyName: z.string().nullable(),
   requestId: z.string(),
   providerKind: ProviderKindSchema.nullable().optional().default(null),

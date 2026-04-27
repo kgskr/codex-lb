@@ -1,4 +1,4 @@
-import { z } from "zod";
+import * as z from "zod";
 
 export const STICKY_SESSION_KINDS = ["codex_session", "sticky_thread", "prompt_cache"] as const;
 export const STICKY_SESSION_SORT_FIELDS = ["updated_at", "created_at", "account", "key"] as const;

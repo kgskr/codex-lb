@@ -1,4 +1,4 @@
-import { z } from "zod";
+import * as z from "zod";
 
 export const FIREWALL_MODES = ["allow_all", "allowlist_active"] as const;
 

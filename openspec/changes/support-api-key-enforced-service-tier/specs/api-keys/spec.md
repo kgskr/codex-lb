@@ -16,3 +16,10 @@ The dashboard API key CRUD surface MUST allow callers to persist an optional enf
 - **WHEN** a dashboard client updates an API key with `enforcedServiceTier: "flex"`
 - **THEN** the persisted API key stores `flex`
 - **AND** subsequent reads return `flex`
+
+#### Scenario: Enforced service tier drives reservation and upstream payload
+
+- **WHEN** a proxy request is authenticated by an API key with `enforcedServiceTier: "priority"`
+- **AND** the caller supplies another service tier
+- **THEN** request-limit reservation uses `priority`
+- **AND** the forwarded upstream payload uses `priority`

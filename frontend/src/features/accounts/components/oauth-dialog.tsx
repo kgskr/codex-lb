@@ -136,6 +136,16 @@ export function OauthDialog({
   const stage = getStage(state);
   const completedRef = useRef(false);
   const browserRefreshInProgress = stage === "browser" && state.status === "starting";
+  const dialogDescription =
+    stage === "success"
+      ? "The account authorization completed successfully."
+      : stage === "error"
+        ? "The account authorization failed and can be retried."
+        : stage === "browser"
+          ? "Complete authorization from the generated browser link."
+          : stage === "device"
+            ? "Complete authorization with the displayed device code."
+            : "Choose a sign-in method and complete authorization.";
 
   useEffect(() => {
     if (stage === "success" && !completedRef.current) {
@@ -174,9 +184,9 @@ export function OauthDialog({
           <DialogTitle>
             {stage === "success" ? "Account added" : stage === "error" ? "Authorization failed" : "Add account with OAuth"}
           </DialogTitle>
-          {stage === "intro" ? (
-            <DialogDescription>Choose a sign-in method and complete authorization.</DialogDescription>
-          ) : null}
+          <DialogDescription className={stage === "intro" ? undefined : "sr-only"}>
+            {dialogDescription}
+          </DialogDescription>
         </DialogHeader>
 
         {/* Intro stage */}

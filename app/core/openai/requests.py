@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from typing import cast, overload
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.types import JsonObject, JsonValue
 from app.core.utils.json_guards import is_json_list, is_json_mapping
+
+type MutableJsonObject = dict[str, JsonValue]
 
 _RESPONSES_INCLUDE_ALLOWLIST = {
     "code_interpreter_call.outputs",
@@ -40,7 +43,7 @@ _ASSISTANT_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _TOOL_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text", "refusal"})
 
 
-def _json_mapping_or_none(value: object) -> Mapping[str, JsonValue] | None:
+def _json_mapping_or_none(value: JsonValue) -> Mapping[str, JsonValue] | None:
     if not is_json_mapping(value):
         return None
     return value
@@ -138,7 +141,7 @@ def _sanitize_interleaved_reasoning_input_item(item: JsonValue) -> JsonValue | N
     if item_mapping is None:
         return item
 
-    sanitized_item: dict[str, JsonValue] = {}
+    sanitized_item: MutableJsonObject = {}
     for key, value in item_mapping.items():
         if key in _INTERLEAVED_REASONING_KEYS:
             continue
@@ -253,9 +256,9 @@ def _normalize_assistant_content(content: JsonValue) -> JsonValue:
     if content is None:
         return None
     if isinstance(content, str):
-        return [{"type": "output_text", "text": content}]
+        return cast(JsonValue, [{"type": "output_text", "text": content}])
     if is_json_list(content):
-        return [_normalize_assistant_content_part(part) for part in _json_parts(content)]
+        return cast(JsonValue, [_normalize_assistant_content_part(part) for part in _json_parts(content)])
     content_mapping = _json_mapping_or_none(content)
     if content_mapping is not None:
         return [_normalize_assistant_content_part(content_mapping)]
@@ -323,18 +326,24 @@ class ResponsesRequest(BaseModel):
     instructions: str
     input: JsonValue
     tools: list[JsonValue] = Field(default_factory=list)
-    tool_choice: str | dict[str, JsonValue] | None = None
+    tool_choice: str | JsonObject | None = None
     parallel_tool_calls: bool | None = None
     reasoning: ResponsesReasoning | None = None
     store: bool = False
     stream: bool | None = None
     include: list[str] = Field(default_factory=list)
     service_tier: str | None = None
+    service_tier_input: str | None = Field(default=None, exclude=True, repr=False)
     conversation: str | None = None
     previous_response_id: str | None = None
     truncation: str | None = None
     prompt_cache_key: str | None = None
     text: ResponsesTextControls | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _capture_service_tier_input_before_validation(cls, data: JsonValue) -> JsonValue:
+        return _capture_service_tier_input(data)
 
     @field_validator("input")
     @classmethod
@@ -369,9 +378,7 @@ class ResponsesRequest(BaseModel):
     @field_validator("store")
     @classmethod
     def _ensure_store_false(cls, value: bool | None) -> bool:
-        if value is True:
-            raise ValueError("store must be false")
-        return False if value is None else value
+        return False
 
     @field_validator("previous_response_id")
     @classmethod
@@ -405,8 +412,13 @@ class ResponsesRequest(BaseModel):
             raise ValueError("Provide either 'conversation' or 'previous_response_id', not both.")
         return self
 
+    def platform_forwarded_service_tier(self) -> str | None:
+        if _is_fast_service_tier_input(self.service_tier_input):
+            return "default"
+        return self.service_tier
+
     def to_payload(self) -> JsonObject:
-        payload = self.model_dump(mode="json", exclude_none=True)
+        payload: MutableJsonObject = self.model_dump(mode="json", exclude_none=True)
         return _strip_unsupported_fields(payload)
 
 
@@ -419,6 +431,7 @@ class ResponsesCompactRequest(BaseModel):
     reasoning: ResponsesReasoning | None = None
     store: bool = False
     service_tier: str | None = None
+    service_tier_input: str | None = Field(default=None, exclude=True, repr=False)
     prompt_cache_key: str | None = None
 
     @field_validator("input")
@@ -438,10 +451,10 @@ class ResponsesCompactRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _normalize_service_tier_aliases_before_validation(cls, data: object) -> object:
+    def _normalize_service_tier_aliases_before_validation(cls, data: JsonValue) -> JsonValue:
         if not is_json_mapping(data):
             return data
-        normalized = dict(data)
+        normalized = _capture_service_tier_input(data)
         service_tier = normalized.get("service_tier")
         normalized_service_tier = _normalize_service_tier_alias_value(service_tier)
         if isinstance(normalized_service_tier, str):
@@ -451,12 +464,15 @@ class ResponsesCompactRequest(BaseModel):
     @field_validator("store")
     @classmethod
     def _ensure_store_false(cls, value: bool) -> bool:
-        if value is True:
-            raise ValueError("store must be false")
-        return value
+        return False
+
+    def platform_forwarded_service_tier(self) -> str | None:
+        if _is_fast_service_tier_input(self.service_tier_input):
+            return "default"
+        return self.service_tier
 
     def to_payload(self) -> JsonObject:
-        payload = self.model_dump(mode="json", exclude_none=True)
+        payload: MutableJsonObject = self.model_dump(mode="json", exclude_none=True)
         return _strip_compact_unsupported_fields(payload)
 
 
@@ -468,7 +484,7 @@ _UNSUPPORTED_UPSTREAM_FIELDS = {
 }
 
 
-def _strip_unsupported_fields(payload: dict[str, JsonValue]) -> dict[str, JsonValue]:
+def _strip_unsupported_fields(payload: MutableJsonObject) -> MutableJsonObject:
     _normalize_openai_compatible_aliases(payload)
     _normalize_service_tier_aliases(payload)
     _sanitize_interleaved_reasoning_input(payload)
@@ -478,7 +494,7 @@ def _strip_unsupported_fields(payload: dict[str, JsonValue]) -> dict[str, JsonVa
     return payload
 
 
-def _canonicalize_tools(payload: dict[str, JsonValue]) -> None:
+def _canonicalize_tools(payload: MutableJsonObject) -> None:
     tools = payload.get("tools")
     if not is_json_list(tools):
         return
@@ -513,13 +529,16 @@ def _sort_keys_recursive(value: JsonValue) -> JsonValue:
     return value
 
 
-def _strip_compact_unsupported_fields(payload: dict[str, JsonValue]) -> dict[str, JsonValue]:
+def _strip_compact_unsupported_fields(payload: MutableJsonObject) -> MutableJsonObject:
     payload = _strip_unsupported_fields(payload)
     payload.pop("store", None)
+    payload.pop("tools", None)
+    payload.pop("tool_choice", None)
+    payload.pop("parallel_tool_calls", None)
     return payload
 
 
-def _sanitize_interleaved_reasoning_input(payload: dict[str, JsonValue]) -> None:
+def _sanitize_interleaved_reasoning_input(payload: MutableJsonObject) -> None:
     input_value = payload.get("input")
     input_items = _json_list_or_none(input_value)
     if input_items is None:
@@ -527,7 +546,7 @@ def _sanitize_interleaved_reasoning_input(payload: dict[str, JsonValue]) -> None
     payload["input"] = _sanitize_input_items(input_items)
 
 
-def _normalize_openai_compatible_aliases(payload: dict[str, JsonValue]) -> None:
+def _normalize_openai_compatible_aliases(payload: MutableJsonObject) -> None:
     reasoning_effort = payload.pop("reasoningEffort", None)
     reasoning_summary = payload.pop("reasoningSummary", None)
     text_verbosity = payload.pop("textVerbosity", None)
@@ -542,7 +561,7 @@ def _normalize_openai_compatible_aliases(payload: dict[str, JsonValue]) -> None:
 
     reasoning_payload = _json_mapping_or_none(payload.get("reasoning"))
     if reasoning_payload is not None:
-        reasoning_map: dict[str, JsonValue] = dict(reasoning_payload.items())
+        reasoning_map: MutableJsonObject = dict(reasoning_payload.items())
     else:
         reasoning_map = {}
 
@@ -555,7 +574,7 @@ def _normalize_openai_compatible_aliases(payload: dict[str, JsonValue]) -> None:
 
     text_payload = _json_mapping_or_none(payload.get("text"))
     if text_payload is not None:
-        text_map: dict[str, JsonValue] = dict(text_payload.items())
+        text_map: MutableJsonObject = dict(text_payload.items())
     else:
         text_map = {}
 
@@ -567,14 +586,37 @@ def _normalize_openai_compatible_aliases(payload: dict[str, JsonValue]) -> None:
         payload["text"] = text_map
 
 
-def _normalize_service_tier_aliases(payload: dict[str, JsonValue]) -> None:
+def _normalize_service_tier_aliases(payload: MutableJsonObject) -> None:
     service_tier = payload.get("service_tier")
     normalized = _normalize_service_tier_alias_value(service_tier)
     if isinstance(normalized, str):
         payload["service_tier"] = normalized
 
 
-def _normalize_service_tier_alias_value(value: object) -> object:
+@overload
+def _capture_service_tier_input(data: Mapping[str, JsonValue]) -> MutableJsonObject: ...
+
+
+@overload
+def _capture_service_tier_input(data: JsonValue) -> JsonValue | MutableJsonObject: ...
+
+
+def _capture_service_tier_input(data: JsonValue) -> JsonValue | MutableJsonObject:
+    if not is_json_mapping(data):
+        return data
+    normalized: MutableJsonObject = dict(data.items())
+    service_tier = normalized.get("service_tier")
+    if isinstance(service_tier, str):
+        stripped = service_tier.strip()
+        normalized["service_tier_input"] = stripped or None
+    return normalized
+
+
+def _is_fast_service_tier_input(value: str | None) -> bool:
+    return isinstance(value, str) and value.lower() == "fast"
+
+
+def _normalize_service_tier_alias_value(value: JsonValue) -> JsonValue:
     if not isinstance(value, str):
         return value
     if value.strip().lower() == "fast":

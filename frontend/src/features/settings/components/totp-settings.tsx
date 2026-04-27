@@ -4,7 +4,7 @@ import { Shield } from "lucide-react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
-import { z } from "zod";
+import * as z from "zod";
 
 import { AlertMessage } from "@/components/alert-message";
 import { Button } from "@/components/ui/button";

@@ -337,6 +337,8 @@ export function createDashboardAuthSession(
 		passwordRequired: true,
 		totpRequiredOnLogin: false,
 		totpConfigured: true,
+		authMode: "standard",
+		passwordManagementEnabled: true,
 		...overrides,
 	});
 }

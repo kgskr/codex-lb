@@ -1,8 +1,9 @@
-# Responses API Compatibility
+# responses-api-compat Specification
 
 ## Purpose
 
-Ensure `/v1/responses` behavior matches OpenAI Responses API expectations for request validation, streaming events, and error envelopes within upstream constraints.
+See context docs for background.
+
 ## Requirements
 ### Requirement: Validate Responses create requests
 The service MUST accept POST requests to `/v1/responses` with a JSON body and MUST validate required fields according to OpenAI Responses API expectations. The request MUST include `model` and `input`, MAY omit `instructions`, MUST reject mutually exclusive fields (`input` and `messages` when both are present), and MUST reject `store=true` with an OpenAI error envelope.
@@ -95,16 +96,20 @@ If the client supplies `include`, the service MUST accept only values documented
 - **WHEN** the client includes an unsupported include value
 - **THEN** the service returns a 4xx OpenAI error envelope indicating the invalid include entry
 
-### Requirement: Allow web_search tools and reject unsupported built-ins
-The service MUST accept Responses requests that include tools with type `web_search` or `web_search_preview`. The service MUST normalize `web_search_preview` to `web_search` before forwarding upstream. The service MUST reject other built-in tool types (file_search, code_interpreter, computer_use, computer_use_preview, image_generation) with an OpenAI invalid_request_error.
+### Requirement: Allow web_search and built-in Responses tools
+The service MUST accept Responses requests that include tools with type `web_search` or `web_search_preview` and MUST normalize `web_search_preview` to `web_search` before forwarding upstream. For other built-in Responses tool types (including `file_search`, `code_interpreter`, `computer_use`, `computer_use_preview`, and `image_generation`), the service MUST accept the request and MUST forward the tool definitions to upstream unchanged except for the documented `web_search_preview` alias. The same behavior MUST apply on HTTP `/v1/responses`, HTTP `/backend-api/codex/responses`, and the WebSocket equivalents that carry `response.create` payloads. Chat Completions tool policy is out of scope for this requirement and remains governed by `chat-completions-compat`.
 
 #### Scenario: web_search_preview tool accepted
 - **WHEN** the client sends `tools=[{"type":"web_search_preview"}]`
 - **THEN** the service accepts the request and forwards the tool as `web_search`
 
-#### Scenario: unsupported built-in tool rejected
-- **WHEN** the client sends `tools=[{"type":"code_interpreter"}]`
-- **THEN** the service returns a 4xx response with an OpenAI invalid_request_error indicating the unsupported tool type
+#### Scenario: built-in Responses tool accepted over HTTP
+- **WHEN** the client sends `/v1/responses` or `/backend-api/codex/responses` with a built-in tool such as `image_generation`, `file_search`, `code_interpreter`, `computer_use`, or `computer_use_preview`
+- **THEN** the service accepts the request and forwards the tool definition unchanged except for the documented `web_search_preview` alias
+
+#### Scenario: built-in Responses tool accepted over WebSocket
+- **WHEN** the client sends a WebSocket `response.create` payload on `/v1/responses` or `/backend-api/codex/responses` with one or more built-in tools
+- **THEN** the service accepts the request and forwards the tool definitions unchanged except for the documented `web_search_preview` alias
 
 ### Requirement: Preserve supported service_tier values
 When a Responses request includes `service_tier`, the service MUST preserve that field in the normalized upstream payload instead of dropping or rewriting it locally.
@@ -313,7 +318,6 @@ For provider-specific capability failures introduced by provider-aware public-ro
 - **WHEN** a request is rejected because `openai_platform` is configured but no eligible `chatgpt_web` routing subject exists for fallback
 - **THEN** the service returns HTTP `400`
 - **AND** it returns an OpenAI-format error envelope with `type = "invalid_request_error"` and `code = "provider_fallback_requires_chatgpt"`
-
 ### Requirement: Use prompt_cache_key as OpenAI cache affinity
 For OpenAI-style `/v1/responses`, `/v1/responses/compact`, and chat-completions requests mapped onto Responses, the service MUST treat a non-empty `prompt_cache_key` as a bounded upstream target affinity key for prompt-cache correctness. When the selected upstream provider is `chatgpt_web`, this continues to mean bounded upstream account affinity. When the selected upstream provider is `openai_platform`, it MUST preserve affinity to the selected provider-scoped routing target without implying ChatGPT-specific session continuity or widening the request's capability set. This affinity MUST apply even when dashboard `sticky_threads_enabled` is disabled, the service MUST continue forwarding the same `prompt_cache_key` upstream unchanged, and the stored affinity MUST expire after the configured freshness window so older keys can rebalance. The freshness window MUST come from dashboard settings so operators can adjust it without restart.
 

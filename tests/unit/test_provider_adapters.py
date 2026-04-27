@@ -140,6 +140,33 @@ async def test_chatgpt_adapter_refresh_usage_delegates_to_usage_updater(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_chatgpt_adapter_fetch_models_delegates_to_core_client(monkeypatch) -> None:
+    async def fake_fetch_models(headers, access_token, account_id):
+        assert headers == {"x-openai-client-version": "0.120.0", "user-agent": "Codex Desktop/0.120.0"}
+        assert access_token == "access"
+        assert account_id == "workspace-acc_test"
+        return SimpleNamespace(
+            payload={"models": [{"slug": "gpt-5.5"}]},
+            upstream_request_id="up_req_live_models",
+        )
+
+    monkeypatch.setattr(provider_adapters_module, "_proxy_fetch_codex_models", fake_fetch_models)
+
+    @asynccontextmanager
+    async def repo_factory() -> AsyncIterator[ProxyRepositories]:
+        yield cast(ProxyRepositories, SimpleNamespace(accounts=object()))
+
+    adapter = ChatGPTWebProviderAdapter(repo_factory)
+    result = await adapter.fetch_models(
+        ProviderSubject(provider_kind="chatgpt_web", routing_subject_id="acc_test", account=_account()),
+        headers={"x-openai-client-version": "0.120.0", "user-agent": "Codex Desktop/0.120.0"},
+    )
+
+    assert result.payload == {"models": [{"slug": "gpt-5.5"}]}
+    assert result.upstream_request_id == "up_req_live_models"
+
+
+@pytest.mark.asyncio
 async def test_chatgpt_adapter_compact_response_delegates_to_core_client(monkeypatch) -> None:
     async def fake_compact(payload, headers, access_token, account_id):
         assert payload.model == "gpt-5.1"
@@ -361,6 +388,53 @@ async def test_platform_adapter_compact_response_delegates_to_core_client(monkey
     assert "error_code=compact_failed" in caplog.text
     assert "error_message=upstream compact failed" in caplog.text
     assert "upstream_request_id=up_req_compact" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_platform_adapter_compact_response_downgrades_fast_alias_to_default(monkeypatch) -> None:
+    async def fake_create_compact_response(*, base_url, payload, api_key, organization=None, project=None):
+        assert base_url == "https://api.openai.com"
+        assert payload["service_tier"] == "default"
+        assert api_key == "sk-platform"
+        assert organization == "org_test"
+        assert project == "proj_test"
+        return SimpleNamespace(
+            payload=CompactResponsePayload.model_validate(
+                {
+                    "object": "response.compaction",
+                    "status": "completed",
+                    "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+                    "output": [],
+                }
+            ),
+            upstream_request_id="up_req_compact_default",
+        )
+
+    monkeypatch.setattr(provider_adapters_module, "create_platform_compact_response", fake_create_compact_response)
+
+    adapter = OpenAIPlatformProviderAdapter()
+    payload = ResponsesCompactRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "summarize",
+            "input": "hello",
+            "service_tier": "fast",
+        }
+    )
+    result = await adapter.compact_response(
+        ProviderSubject(
+            provider_kind=OPENAI_PLATFORM_PROVIDER_KIND,
+            routing_subject_id="plat_1",
+            api_key_encrypted=TokenEncryptor().encrypt("sk-platform"),
+            organization_id="org_test",
+            project_id="proj_test",
+        ),
+        payload,
+        {"x-test": "1"},
+    )
+
+    assert result.upstream_request_id == "up_req_compact_default"
+    assert result.payload.status == "completed"
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from alembic import command
 from alembic.util.exc import CommandError
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy import exc as sa_exc
@@ -233,6 +234,48 @@ def test_request_logs_transport_stays_in_additive_migration_chain(tmp_path: Path
         assert "transport" in columns
 
 
+def test_request_logs_response_lookup_migration_handles_preexisting_session_id_column(tmp_path: Path) -> None:
+    db_path = tmp_path / "request-logs-session-id-drift.db"
+    url = _db_url(db_path)
+    pre_revision = "20260413_000000_add_accounts_blocked_at"
+    target_revision = "20260415_160000_add_request_logs_response_lookup_index"
+
+    run_upgrade(url, pre_revision, bootstrap_legacy=False)
+
+    sync_url = to_sync_database_url(url)
+    with create_engine(sync_url, future=True).connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("request_logs")}
+        assert "session_id" not in columns
+        connection.execute(text("ALTER TABLE request_logs ADD COLUMN session_id VARCHAR"))
+        connection.commit()
+
+    result = run_upgrade(url, target_revision, bootstrap_legacy=False)
+    assert result.current_revision == target_revision
+
+    with create_engine(sync_url, future=True).connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("request_logs")}
+        assert "session_id" in columns
+        index_names = {index["name"] for index in inspect(connection).get_indexes("request_logs")}
+        assert "idx_logs_request_status_api_key_time" in index_names
+        assert "idx_logs_request_status_api_key_session_time" in index_names
+
+
+def test_request_logs_response_lookup_downgrade_preserves_session_id_column(tmp_path: Path) -> None:
+    db_path = tmp_path / "request-logs-session-id-downgrade.db"
+    url = _db_url(db_path)
+    pre_revision = "20260413_000000_add_accounts_blocked_at"
+    target_revision = "20260415_160000_add_request_logs_response_lookup_index"
+
+    run_upgrade(url, target_revision, bootstrap_legacy=False)
+    command.downgrade(_build_alembic_config(url), pre_revision)
+
+    sync_url = to_sync_database_url(url)
+    with create_engine(sync_url, future=True).connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("request_logs")}
+
+    assert "session_id" in columns
+
+
 def test_check_schema_drift_detects_rogue_table(tmp_path: Path) -> None:
     db_path = tmp_path / "drift.db"
     url = _db_url(db_path)
@@ -304,6 +347,31 @@ def test_run_upgrade_auto_remaps_legacy_revision_ids(tmp_path: Path) -> None:
 
     result = run_upgrade(url, "head", bootstrap_legacy=False)
     assert result.current_revision == initial.current_revision
+
+
+def test_run_upgrade_legacy_import_default_revision_still_runs_bridge_migrations(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy-import-default-remap.db"
+    url = _db_url(db_path)
+    pre_bridge_revision = "20260408_010000_merge_import_without_overwrite_and_assignment_heads"
+
+    run_upgrade(url, pre_bridge_revision, bootstrap_legacy=False)
+
+    sync_url = to_sync_database_url(url)
+    with create_engine(sync_url, future=True).begin() as connection:
+        inspector = inspect(connection)
+        assert not inspector.has_table("http_bridge_sessions")
+        connection.execute(
+            text("UPDATE alembic_version SET version_num = :legacy"),
+            {"legacy": "20260410_020000_restore_import_without_overwrite_default_false"},
+        )
+
+    result = run_upgrade(url, "head", bootstrap_legacy=False)
+    assert result.current_revision == inspect_migration_state(url).head_revision
+
+    with create_engine(sync_url, future=True).connect() as connection:
+        inspector = inspect(connection)
+        assert inspector.has_table("http_bridge_sessions")
+        assert inspector.has_table("http_bridge_session_aliases")
 
 
 def test_run_upgrade_without_auto_remap_fails_for_legacy_revision_ids(tmp_path: Path) -> None:

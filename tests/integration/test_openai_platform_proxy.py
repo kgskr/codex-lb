@@ -110,11 +110,27 @@ def _disable_http_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
         transcription_request_budget_seconds=120.0,
         upstream_compact_timeout_seconds=None,
         upstream_stream_transport="auto",
+        http_responses_session_bridge_idle_ttl_seconds=120.0,
+        http_responses_session_bridge_codex_idle_ttl_seconds=900.0,
+        http_responses_session_bridge_codex_prewarm_enabled=False,
+        http_responses_session_bridge_max_sessions=128,
+        http_responses_session_bridge_queue_limit=8,
+        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
+        http_responses_session_bridge_gateway_safe_mode=False,
+        http_responses_session_bridge_instance_id="test-instance",
+        http_responses_session_bridge_instance_ring=[],
+        http_responses_session_bridge_advertise_base_url=None,
         log_proxy_request_payload=False,
         log_proxy_request_shape=False,
         log_proxy_request_shape_raw_cache_key=False,
         log_proxy_service_tier_trace=False,
         stream_idle_timeout_seconds=300.0,
+        proxy_downstream_websocket_idle_timeout_seconds=120.0,
+        proxy_token_refresh_limit=32,
+        proxy_upstream_websocket_connect_limit=64,
+        proxy_response_create_limit=64,
+        proxy_compact_response_create_limit=16,
+        proxy_admission_wait_timeout_seconds=10.0,
         drain_primary_threshold_pct=85.0,
         drain_secondary_threshold_pct=90.0,
         platform_fallback_force_enabled=False,
@@ -580,7 +596,7 @@ async def test_v1_responses_falls_back_to_platform_for_stateless_requests(async_
     async def fake_create_platform_response(*, base_url, payload, api_key, organization=None, project=None):
         del base_url, api_key, organization, project
         assert payload["model"] == "gpt-5.1"
-        assert payload["service_tier"] == "priority"
+        assert payload["service_tier"] == "default"
         _assert_platform_text_input(payload, "hi")
         return PlatformResponseResult(
             payload=OpenAIResponsePayload.model_validate(
@@ -613,6 +629,46 @@ async def test_v1_responses_falls_back_to_platform_for_stateless_requests(async_
     assert log.upstream_request_id == "up_req_resp_1"
     assert log.requested_service_tier == "priority"
     assert log.actual_service_tier == "default"
+    assert log.service_tier == "default"
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_platform_uses_default_tier_when_fast_alias_response_omits_echo(async_client, monkeypatch):
+    account_id = await _import_account(async_client, "acc_resp_fast_default", "resp-fast-default@example.com")
+    await _seed_primary_usage(account_id, 95.0)
+    identity_id = await _create_platform_identity(async_client, monkeypatch, route_families=["public_responses_http"])
+
+    async def fake_create_platform_response(*, base_url, payload, api_key, organization=None, project=None):
+        del base_url, api_key, organization, project
+        assert payload["model"] == "gpt-5.1"
+        assert payload["service_tier"] == "default"
+        _assert_platform_text_input(payload, "hi")
+        return PlatformResponseResult(
+            payload=OpenAIResponsePayload.model_validate(
+                {
+                    "id": "resp_platform_default_fallback",
+                    "status": "completed",
+                    "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                }
+            ),
+            upstream_request_id="up_req_resp_default_fallback",
+        )
+
+    monkeypatch.setattr(provider_adapters_module, "create_platform_response", fake_create_platform_response)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.1", "input": "hi", "service_tier": "fast"},
+    )
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_platform_default_fallback"
+
+    log = await _latest_request_log()
+    assert log is not None
+    assert log.provider_kind == "openai_platform"
+    assert log.routing_subject_id == identity_id
+    assert log.requested_service_tier == "priority"
+    assert log.actual_service_tier is None
     assert log.service_tier == "default"
 
 
@@ -803,6 +859,7 @@ async def test_v1_responses_stream_falls_back_to_platform_when_primary_usage_is_
     async def fake_stream_platform_responses(*, base_url, payload, api_key, organization=None, project=None):
         del base_url, api_key, organization, project
         assert payload["model"] == "gpt-5.1"
+        assert payload["service_tier"] == "default"
         _assert_platform_text_input(payload, "hi")
         return PlatformStreamResponse(
             event_stream=_stream_lines(
@@ -820,7 +877,7 @@ async def test_v1_responses_stream_falls_back_to_platform_when_primary_usage_is_
     async with async_client.stream(
         "POST",
         "/v1/responses",
-        json={"model": "gpt-5.1", "input": "hi", "stream": True},
+        json={"model": "gpt-5.1", "input": "hi", "stream": True, "service_tier": "fast"},
     ) as response:
         assert response.status_code == 200
         lines = [line async for line in response.aiter_lines() if line]
@@ -835,6 +892,9 @@ async def test_v1_responses_stream_falls_back_to_platform_when_primary_usage_is_
     assert log.routing_subject_id == identity_id
     assert log.route_class == "openai_public_http"
     assert log.upstream_request_id == "up_req_resp_stream_1"
+    assert log.requested_service_tier == "priority"
+    assert log.actual_service_tier is None
+    assert log.service_tier == "default"
 
 
 @pytest.mark.asyncio

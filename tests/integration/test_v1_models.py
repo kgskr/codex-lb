@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
+import app.modules.proxy.api as proxy_api_module
+import app.modules.proxy.service as proxy_service_module
 from app.core.openai.model_registry import ReasoningLevel, UpstreamModel, get_model_registry
+from app.modules.proxy.provider_adapters import ProviderModelsResult
 
 pytestmark = pytest.mark.integration
 
@@ -242,6 +245,68 @@ async def test_backend_codex_models_empty_when_registry_not_populated(async_clie
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["models"] == []
+
+
+@pytest.mark.asyncio
+async def test_backend_codex_models_uses_live_chatgpt_catalog(async_client, monkeypatch):
+    registry = get_model_registry()
+    registry._snapshot = None
+
+    async def fake_fetch_chatgpt_codex_models(self, api_key, *, headers, route_class="chatgpt_private"):
+        del self, api_key, route_class
+        assert headers["x-openai-client-version"] == "0.120.0"
+        assert headers["user-agent"] == "Codex Desktop/0.120.0"
+        return ProviderModelsResult(
+            payload={
+                "models": [
+                    {
+                        "slug": "gpt-5.5",
+                        "display_name": "gpt-5.5",
+                        "description": "Test model gpt-5.5",
+                        "base_instructions": "",
+                        "default_reasoning_level": "medium",
+                        "supported_reasoning_levels": [{"effort": "medium", "description": "default"}],
+                        "supported_in_api": True,
+                        "priority": 0,
+                        "minimal_client_version": "0.120.0",
+                        "supports_reasoning_summaries": True,
+                        "support_verbosity": False,
+                        "default_verbosity": None,
+                        "supports_parallel_tool_calls": True,
+                        "context_window": 400000,
+                        "input_modalities": ["text", "image"],
+                        "available_in_plans": ["pro"],
+                        "prefer_websockets": True,
+                        "visibility": "list",
+                    }
+                ]
+            },
+            upstream_request_id="up_req_live_models",
+        )
+
+    def fail_registry_payload(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("registry fallback should not run when live ChatGPT model discovery succeeds")
+
+    monkeypatch.setattr(
+        proxy_service_module.ProxyService,
+        "fetch_chatgpt_codex_models",
+        fake_fetch_chatgpt_codex_models,
+    )
+    monkeypatch.setattr(proxy_api_module, "_build_registry_codex_models_payload", fail_registry_payload)
+
+    resp = await async_client.get(
+        "/backend-api/codex/models",
+        headers={
+            "x-openai-client-version": "0.120.0",
+            "user-agent": "Codex Desktop/0.120.0",
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert [entry["slug"] for entry in payload["models"]] == ["gpt-5.5"]
+    assert payload["models"][0]["minimal_client_version"] == "0.120.0"
+    assert payload["models"][0]["prefer_websockets"] is True
 
 
 @pytest.mark.asyncio

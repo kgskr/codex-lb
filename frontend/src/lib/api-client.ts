@@ -1,5 +1,6 @@
 import { ApiErrorResponseSchema } from "@/schemas/api";
-import { z, type ZodType } from "zod";
+import * as z from "zod";
+import type { ZodType } from "zod";
 
 type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 

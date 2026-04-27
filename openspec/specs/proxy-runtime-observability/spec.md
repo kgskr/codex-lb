@@ -1,7 +1,8 @@
 # proxy-runtime-observability Specification
 
 ## Purpose
-Define the runtime console logging contract for operator-visible proxy observability.
+
+See context docs for background.
 
 ## Requirements
 ### Requirement: Console runtime logs include explicit timestamps
@@ -59,7 +60,7 @@ Persisted request logs MUST no longer be account-only records. For provider-awar
 - **AND** it logs the cleanup failure without replacing the original response with a cleanup error
 
 ### Requirement: Proxy 4xx/5xx responses are logged with provider-aware rejection detail
-When the proxy returns a 4xx or 5xx response for a proxied request, the system MUST log the request id, method, path, status code, error code, and error message to the console. When the failure is caused by provider capability gating before routing-subject selection, the log MUST also include the requested route class and rejection reason.
+When the proxy returns a 4xx or 5xx response for a proxied request, the system MUST log the request id, method, path, status code, error code, and error message to the console. When the failure is caused by provider capability gating before routing-subject selection, the log MUST also include the requested route class and rejection reason. For local admission rejections, the log MUST also include which admission lane or stage rejected the request.
 
 #### Scenario: Upstream failure becomes a proxy error response
 - **WHEN** an upstream 4xx or 5xx failure is returned to the client by the proxy
@@ -68,6 +69,11 @@ When the proxy returns a 4xx or 5xx response for a proxied request, the system M
 #### Scenario: Local proxy validation or server error is returned
 - **WHEN** the proxy itself returns a 4xx or 5xx response before or without an upstream response
 - **THEN** the console log includes the local response status plus the error code and message
+
+#### Scenario: Local admission rejection is logged
+- **WHEN** the proxy rejects a request locally because a downstream or expensive-work admission lane is full
+- **THEN** the console log includes the local response status, normalized error code and message
+- **AND** it includes which admission lane or stage rejected the request
 
 #### Scenario: Provider capability mismatch is rejected before selection
 - **WHEN** the proxy rejects a request before upstream selection because no provider supports the requested route, transport, or continuity capability

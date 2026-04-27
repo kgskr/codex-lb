@@ -313,7 +313,7 @@ class AccountsService:
         )
 
     async def reactivate_account(self, account_id: str) -> bool:
-        result = await self._repo.update_status(account_id, AccountStatus.ACTIVE, None)
+        result = await self._repo.update_status(account_id, AccountStatus.ACTIVE, None, None, blocked_at=None)
         if not result and self._platform_service is not None:
             result = await self._platform_service.reactivate_identity(account_id)
         if result:
@@ -321,7 +321,7 @@ class AccountsService:
         return result
 
     async def pause_account(self, account_id: str) -> bool:
-        result = await self._repo.update_status(account_id, AccountStatus.PAUSED, None)
+        result = await self._repo.update_status(account_id, AccountStatus.PAUSED, None, None, blocked_at=None)
         if not result and self._platform_service is not None:
             result = await self._platform_service.pause_identity(account_id)
         if result:

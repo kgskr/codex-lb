@@ -9,12 +9,13 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 import time
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import (
-    Any,
     AsyncContextManager,
     AsyncIterator,
     Awaitable,
@@ -29,12 +30,13 @@ from urllib.parse import ParseResult, urlparse, urlunparse
 
 import aiohttp
 from aiohttp import hdrs
-from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT
+from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT, WebSocketDataQueue
 from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
 from multidict import CIMultiDict
 
+from app.core.clients.codex_version import get_codex_version_cache
 from app.core.clients.http import get_http_client
-from app.core.config.settings import get_settings
+from app.core.config.settings import Settings, get_settings
 from app.core.errors import (
     OpenAIErrorDetail,
     OpenAIErrorEnvelope,
@@ -51,11 +53,13 @@ from app.core.openai.parsing import (
 )
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.resilience.circuit_breaker import (
+    CircuitBreaker,
     CircuitBreakerOpenError,
     _is_server_error,
     get_circuit_breaker_for_account,
 )
 from app.core.types import JsonObject, JsonValue
+from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import format_sse_event
 
@@ -87,6 +91,12 @@ _IMAGE_INLINE_MAX_BYTES = 8 * 1024 * 1024
 _IMAGE_INLINE_CHUNK_SIZE = 64 * 1024
 _IMAGE_INLINE_TIMEOUT_SECONDS = 8.0
 _BLOCKED_LITERAL_HOSTS = {"localhost", "localhost.localdomain"}
+_UPSTREAM_RESPONSE_CREATE_WARN_BYTES = 12 * 1024 * 1024
+_UPSTREAM_RESPONSE_CREATE_MAX_BYTES = 15 * 1024 * 1024
+_RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE = (
+    "[codex-lb omitted historical tool output ({bytes} bytes) to fit upstream websocket budget]"
+)
+_RESPONSE_CREATE_IMAGE_OMISSION_NOTICE = "[codex-lb omitted historical inline image to fit upstream websocket budget]"
 _UPSTREAM_TRACE_HEADER_ALLOWLIST = frozenset(
     {
         "accept",
@@ -122,6 +132,7 @@ _NATIVE_CODEX_STREAM_HEADER_KEYS = frozenset(
         "x-codex-beta-features",
     }
 )
+_SEMVER_IN_TEXT_RE = re.compile(r"(?<!\d)(\d+\.\d+\.\d+)(?!\d)")
 
 
 def _normalize_chatgpt_web_service_tier(value: object) -> str | None:
@@ -161,6 +172,7 @@ _HOP_BY_HOP_HEADER_NAMES = frozenset(
 _AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES = frozenset({426})
 _WEBSOCKET_RESPONSE_CREATE_EXCLUDED_FIELDS = frozenset({"background", "stream"})
 _WEBSOCKET_HANDSHAKE_ERROR_HINTS = (
+    ("account_deactivated", "account has been deactivated"),
     ("usage_not_included", "usage not included"),
     ("insufficient_quota", "insufficient quota"),
     ("quota_exceeded", "quota exceeded"),
@@ -204,7 +216,7 @@ R = TypeVar("R")
 async def _call_with_service_circuit_breaker(
     request: Awaitable[R],
     *,
-    settings: object | None = None,
+    settings: Settings | None = None,
     account_id: str | None = None,
 ) -> R:
     if not account_id:
@@ -220,7 +232,7 @@ async def _call_with_service_circuit_breaker(
 async def _service_circuit_breaker_context(
     cm: AsyncContextManager[aiohttp.ClientResponse],
     *,
-    settings: object | None = None,
+    settings: Settings | None = None,
     account_id: str | None = None,
 ) -> AsyncIterator[aiohttp.ClientResponse]:
     """Wrap an async context manager with circuit breaker protection."""
@@ -268,7 +280,10 @@ _HELD_HALF_OPEN_PROBE_FLAG = "_codex_lb_half_open_probe_held"
 _HELD_HALF_OPEN_PROBE_BREAKER = "_codex_lb_half_open_probe_breaker"
 
 
-def _bind_half_open_probe(websocket: aiohttp.ClientWebSocketResponse, circuit_breaker: object) -> None:
+def _bind_half_open_probe(
+    websocket: aiohttp.ClientWebSocketResponse,
+    circuit_breaker: "CircuitBreaker",
+) -> None:
     setattr(websocket, _HELD_HALF_OPEN_PROBE_FLAG, True)
     setattr(websocket, _HELD_HALF_OPEN_PROBE_BREAKER, circuit_breaker)
 
@@ -276,11 +291,11 @@ def _bind_half_open_probe(websocket: aiohttp.ClientWebSocketResponse, circuit_br
 async def _release_bound_half_open_probe(websocket: aiohttp.ClientWebSocketResponse | None) -> None:
     if websocket is None or not getattr(websocket, _HELD_HALF_OPEN_PROBE_FLAG, False):
         return
-    circuit_breaker = getattr(websocket, _HELD_HALF_OPEN_PROBE_BREAKER, None)
+    circuit_breaker = cast("CircuitBreaker | None", getattr(websocket, _HELD_HALF_OPEN_PROBE_BREAKER, None))
     setattr(websocket, _HELD_HALF_OPEN_PROBE_FLAG, False)
     setattr(websocket, _HELD_HALF_OPEN_PROBE_BREAKER, None)
     if circuit_breaker is not None:
-        await cast(Any, circuit_breaker).release_half_open_probe()
+        await circuit_breaker.release_half_open_probe()
 
 
 class StreamIdleTimeoutError(Exception):
@@ -354,6 +369,12 @@ class ProxyResponseError(Exception):
         self.routing_subject_id = routing_subject_id
 
 
+@dataclass(frozen=True, slots=True)
+class CodexModelsResult:
+    payload: dict[str, JsonValue]
+    upstream_request_id: str | None
+
+
 def _should_drop_inbound_header(name: str) -> bool:
     normalized = name.lower()
     if normalized in IGNORE_INBOUND_HEADERS:
@@ -384,6 +405,24 @@ def _build_upstream_headers(
     headers["Authorization"] = f"Bearer {access_token}"
     headers["Accept"] = accept
     headers["Content-Type"] = "application/json"
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    return headers
+
+
+def _build_upstream_model_headers(
+    inbound: Mapping[str, str],
+    access_token: str,
+    account_id: str | None,
+) -> dict[str, str]:
+    headers = dict(inbound)
+    lower_keys = {key.lower() for key in headers}
+    if "x-request-id" not in lower_keys and "request-id" not in lower_keys:
+        request_id = get_request_id()
+        if request_id:
+            headers["x-request-id"] = request_id
+    headers["Authorization"] = f"Bearer {access_token}"
+    headers["Accept"] = "application/json"
     if account_id:
         headers["chatgpt-account-id"] = account_id
     return headers
@@ -666,6 +705,33 @@ def _route_class_for_upstream_target(url: str) -> str:
     return "chatgpt_private"
 
 
+def _resolve_codex_models_client_version(inbound_headers: Mapping[str, str]) -> str | None:
+    explicit_version: str | None = None
+    user_agent_candidates: list[str] = []
+
+    for key, value in inbound_headers.items():
+        if not isinstance(value, str):
+            continue
+        normalized_key = key.lower()
+        stripped_value = value.strip()
+        if not stripped_value:
+            continue
+        if normalized_key == "x-openai-client-version":
+            explicit_version = stripped_value
+            break
+        if normalized_key in {"user-agent", "x-openai-client-user-agent"}:
+            user_agent_candidates.append(stripped_value)
+
+    if explicit_version is not None:
+        return explicit_version
+
+    for candidate in user_agent_candidates:
+        match = _SEMVER_IN_TEXT_RE.search(candidate)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
 def _normalize_error_code(code: str | None, error_type: str | None) -> str:
     if code:
         normalized_code = code.lower()
@@ -887,7 +953,7 @@ def _openai_error_detail(error: OpenAIError) -> OpenAIErrorDetail:
     return detail
 
 
-def _extract_upstream_message(data: Mapping[str, object]) -> str | None:
+def _extract_upstream_message(data: Mapping[str, JsonValue]) -> str | None:
     for key in ("message", "detail", "error"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
@@ -990,13 +1056,26 @@ def _has_native_codex_transport_headers(headers: Mapping[str, str]) -> bool:
     return any(key in normalized for key in _NATIVE_CODEX_STREAM_HEADER_KEYS)
 
 
-def _is_native_codex_originator(originator: object) -> bool:
-    if not isinstance(originator, str):
+def _is_native_codex_originator(originator: str | None) -> bool:
+    if originator is None:
         return False
     stripped = originator.strip()
     if not stripped:
         return False
     return stripped in _NATIVE_CODEX_ORIGINATORS
+
+
+def _payload_uses_image_generation_tool(payload: Mapping[str, JsonValue]) -> bool:
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = tool.get("type")
+        if tool_type == "image_generation":
+            return True
+    return False
 
 
 def _resolve_stream_transport(
@@ -1005,11 +1084,14 @@ def _resolve_stream_transport(
     transport_override: str | None,
     model: str | None,
     headers: Mapping[str, str],
+    has_image_generation_tool: bool = False,
 ) -> str:
     configured = _configured_stream_transport(transport=transport, transport_override=transport_override)
     if configured == "websocket":
         return "websocket"
     if configured == "http":
+        return "http"
+    if has_image_generation_tool:
         return "http"
     if _has_native_codex_transport_headers(headers):
         return "websocket"
@@ -1085,10 +1167,9 @@ async def _open_upstream_websocket(
     request_headers[hdrs.SEC_WEBSOCKET_KEY] = sec_key
 
     timeout = aiohttp.ClientTimeout(total=connect_timeout_seconds, sock_connect=connect_timeout_seconds)
-    request_fn = cast(Any, request)
     try:
         try:
-            resp = await request_fn(
+            resp = await request(
                 hdrs.METH_GET,
                 url,
                 headers=request_headers,
@@ -1146,8 +1227,7 @@ async def _open_upstream_websocket(
 
             transport = conn.transport
             assert transport is not None
-            web_socket_data_queue = cast(Callable[..., Any], getattr(aiohttp.client_ws, "WebSocketDataQueue"))
-            reader = web_socket_data_queue(conn_proto, 2**16, loop=session._loop)
+            reader = WebSocketDataQueue(conn_proto, 2**16, loop=session._loop)
             conn_proto.set_parser(WebSocketReader(reader, max_msg_size), reader)
             writer = WebSocketWriter(conn_proto, transport, use_mask=True, compress=0, notakeover=False)
         except BaseException as exc:
@@ -1252,7 +1332,7 @@ async def _stream_responses_via_websocket(
 ) -> AsyncIterator[str]:
     websocket_url = _to_websocket_upstream_url(url)
     request_started_at = time.monotonic()
-    request_payload = _build_websocket_response_create_payload(payload_dict)
+    request_payload = _prepare_websocket_response_create_payload(payload_dict)
     websocket_cm: AsyncContextManager[aiohttp.ClientWebSocketResponse] | None = None
     websocket: aiohttp.ClientWebSocketResponse | None = None
     circuit_breaker = None
@@ -1300,7 +1380,7 @@ async def _stream_responses_via_websocket(
         )
         if callable(send_json):
             await asyncio.wait_for(
-                cast(Any, send_json)(request_payload),
+                cast(Callable[[JsonObject], Awaitable[None]], send_json)(request_payload),
                 timeout=remaining_total_timeout,
             )
         else:
@@ -1343,6 +1423,193 @@ def _build_websocket_response_create_payload(payload_dict: JsonObject) -> JsonOb
     }
     request_payload["type"] = "response.create"
     return request_payload
+
+
+def _prepare_websocket_response_create_payload(payload_dict: JsonObject) -> JsonObject:
+    request_payload = _build_websocket_response_create_payload(payload_dict)
+    payload_text = json.dumps(request_payload, ensure_ascii=True, separators=(",", ":"))
+    payload_size = len(payload_text.encode("utf-8"))
+    if payload_size > _UPSTREAM_RESPONSE_CREATE_MAX_BYTES:
+        slimmed_payload, slim_summary = _slim_response_create_payload_for_upstream(
+            request_payload,
+            max_bytes=_UPSTREAM_RESPONSE_CREATE_MAX_BYTES,
+        )
+        if slim_summary is not None:
+            request_payload = cast(JsonObject, slimmed_payload)
+            slimmed_text = json.dumps(request_payload, ensure_ascii=True, separators=(",", ":"))
+            logger.warning(
+                (
+                    "Slimmed response.create before upstream websocket connect request_id=%s "
+                    "original_bytes=%s slimmed_bytes=%s historical_tool_outputs_slimmed=%s "
+                    "historical_images_slimmed=%s"
+                ),
+                get_request_id(),
+                payload_size,
+                len(slimmed_text.encode("utf-8")),
+                slim_summary["historical_tool_outputs_slimmed"],
+                slim_summary["historical_images_slimmed"],
+            )
+            payload_text = slimmed_text
+            payload_size = len(payload_text.encode("utf-8"))
+    if payload_size > _UPSTREAM_RESPONSE_CREATE_WARN_BYTES:
+        previous_response_id = request_payload.get("previous_response_id")
+        logger.warning(
+            "Large response.create prepared request_id=%s bytes=%s previous_response_id=%s",
+            get_request_id(),
+            payload_size,
+            previous_response_id if isinstance(previous_response_id, str) else None,
+        )
+    if payload_size <= _UPSTREAM_RESPONSE_CREATE_MAX_BYTES:
+        return request_payload
+    raise ProxyResponseError(
+        413,
+        _response_create_too_large_error_envelope(payload_size, _UPSTREAM_RESPONSE_CREATE_MAX_BYTES),
+        failure_phase="validation",
+        failure_detail=f"response.create_bytes={payload_size}",
+    )
+
+
+def _response_create_too_large_error_envelope(actual_bytes: int, max_bytes: int) -> OpenAIErrorEnvelope:
+    payload = openai_error(
+        "payload_too_large",
+        (
+            "response.create is too large for upstream websocket "
+            f"({actual_bytes} bytes > {max_bytes} bytes). "
+            "Reduce historical images/screenshots or compact the thread."
+        ),
+        error_type="invalid_request_error",
+    )
+    payload["error"]["param"] = "input"
+    return payload
+
+
+def _slim_response_create_payload_for_upstream(
+    payload: JsonObject,
+    *,
+    max_bytes: int,
+) -> tuple[JsonObject, dict[str, int] | None]:
+    del max_bytes
+    input_value = payload.get("input")
+    if not isinstance(input_value, list) or not input_value:
+        return payload, None
+
+    input_items = cast(list[JsonValue], deepcopy(input_value))
+    preserve_from = _response_create_recent_suffix_start(input_items)
+    historical = input_items[:preserve_from]
+    recent = input_items[preserve_from:]
+
+    tool_outputs_slimmed = 0
+    images_slimmed = 0
+
+    slimmed_historical: list[JsonValue] = []
+    for item in historical:
+        slimmed_item, item_tool_outputs_slimmed, item_images_slimmed = _slim_historical_response_input_item(item)
+        tool_outputs_slimmed += item_tool_outputs_slimmed
+        images_slimmed += item_images_slimmed
+        slimmed_historical.append(slimmed_item)
+
+    if tool_outputs_slimmed == 0 and images_slimmed == 0:
+        return payload, None
+
+    candidate_payload = dict(payload)
+    candidate_payload["input"] = slimmed_historical + recent
+    return candidate_payload, {
+        "historical_tool_outputs_slimmed": tool_outputs_slimmed,
+        "historical_images_slimmed": images_slimmed,
+    }
+
+
+def _response_create_recent_suffix_start(input_items: list[JsonValue]) -> int:
+    last_user_index: int | None = None
+    for index, item in enumerate(input_items):
+        if not is_json_mapping(item):
+            continue
+        if item.get("role") == "user":
+            last_user_index = index
+    if last_user_index is not None:
+        return last_user_index
+    return 0
+
+
+def _slim_historical_response_input_item(item: JsonValue) -> tuple[JsonValue, int, int]:
+    if not is_json_mapping(item):
+        return item, 0, 0
+
+    item_mapping = dict(cast(dict[str, JsonValue], deepcopy(item)))
+    tool_outputs_slimmed = 0
+    images_slimmed = 0
+
+    if item_mapping.get("type") == "function_call_output":
+        output = item_mapping.get("output")
+        output_text = output if isinstance(output, str) else None
+        if output_text is not None and _should_slim_historical_tool_output(output_text):
+            item_mapping["output"] = _RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
+                bytes=len(output_text.encode("utf-8"))
+            )
+            tool_outputs_slimmed += 1
+
+    content = item_mapping.get("content")
+    slimmed_content, content_images_slimmed = _slim_historical_response_content(content)
+    if content_images_slimmed > 0:
+        item_mapping["content"] = slimmed_content
+        images_slimmed += content_images_slimmed
+
+    if item_mapping.get("type") == "input_image" and _is_inline_image_reference(item_mapping.get("image_url")):
+        return _response_create_inline_image_notice_item(), tool_outputs_slimmed, images_slimmed + 1
+
+    return item_mapping, tool_outputs_slimmed, images_slimmed
+
+
+def _slim_historical_response_content(content: JsonValue) -> tuple[JsonValue, int]:
+    if is_json_mapping(content):
+        return _slim_historical_response_content_part(content)
+    if not isinstance(content, list):
+        return content, 0
+
+    slimmed_parts: list[JsonValue] = []
+    images_slimmed = 0
+    for part in content:
+        slimmed_part, part_images_slimmed = _slim_historical_response_content_part(part)
+        slimmed_parts.append(slimmed_part)
+        images_slimmed += part_images_slimmed
+    return slimmed_parts, images_slimmed
+
+
+def _slim_historical_response_content_part(part: JsonValue) -> tuple[JsonValue, int]:
+    if not is_json_mapping(part):
+        return part, 0
+
+    part_mapping = dict(cast(dict[str, JsonValue], deepcopy(part)))
+    part_type = part_mapping.get("type")
+    if part_type == "input_image" and _is_inline_image_reference(part_mapping.get("image_url")):
+        return _response_create_inline_image_notice_part(), 1
+
+    if part_type == "image_url":
+        image_url_value = part_mapping.get("image_url")
+        if is_json_mapping(image_url_value):
+            image_url = image_url_value.get("url")
+        else:
+            image_url = image_url_value
+        if _is_inline_image_reference(image_url):
+            return _response_create_inline_image_notice_part(), 1
+
+    return part_mapping, 0
+
+
+def _response_create_inline_image_notice_part() -> JsonObject:
+    return {"type": "input_text", "text": _RESPONSE_CREATE_IMAGE_OMISSION_NOTICE}
+
+
+def _response_create_inline_image_notice_item() -> JsonObject:
+    return {"role": "user", "content": [_response_create_inline_image_notice_part()]}
+
+
+def _is_inline_image_reference(value: JsonValue) -> bool:
+    return isinstance(value, str) and value.startswith("data:image/")
+
+
+def _should_slim_historical_tool_output(output: str) -> bool:
+    return "data:image/" in output or len(output.encode("utf-8")) > 32 * 1024
 
 
 async def _inline_input_image_urls(
@@ -1665,6 +1932,130 @@ async def maybe_inline_payload_input_images(
     )
 
 
+async def fetch_codex_models(
+    headers: Mapping[str, str],
+    access_token: str,
+    account_id: str | None,
+    *,
+    base_url: str | None = None,
+    session: aiohttp.ClientSession | None = None,
+) -> CodexModelsResult:
+    settings = get_settings()
+    upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
+    requested_client_version = _resolve_codex_models_client_version(headers)
+    client_version = requested_client_version or await get_codex_version_cache().get_version()
+    url = f"{upstream_base}/codex/models?client_version={client_version}"
+    filtered_headers = filter_inbound_headers(headers)
+    upstream_headers = _build_upstream_model_headers(filtered_headers, access_token, account_id)
+    request_timeout = aiohttp.ClientTimeout(total=settings.upstream_connect_timeout_seconds)
+    client_session = session or get_http_client().session
+    started_at = time.monotonic()
+    status_code: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    upstream_request_id: str | None = None
+    _maybe_log_upstream_request_start(
+        kind="models",
+        url=url,
+        headers=upstream_headers,
+        method="GET",
+        payload_summary="-",
+    )
+    try:
+        async with _service_circuit_breaker_context(
+            client_session.get(
+                url,
+                headers=upstream_headers,
+                timeout=request_timeout,
+            ),
+            settings=settings,
+            account_id=account_id,
+        ) as resp:
+            status_code = resp.status
+            upstream_request_id = resp.headers.get("x-request-id") or resp.headers.get("request-id")
+            if resp.status >= 400:
+                error_payload = await _error_payload_from_response(resp)
+                error_code, error_message = _error_details_from_envelope(error_payload)
+                raise ProxyResponseError(
+                    resp.status,
+                    error_payload,
+                    upstream_request_id=upstream_request_id,
+                )
+            try:
+                data = await resp.json(content_type=None)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                message = str(exc) or "Request to upstream timed out"
+                error_code = "upstream_unavailable"
+                error_message = message
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_unavailable", message),
+                    upstream_request_id=upstream_request_id,
+                ) from exc
+            except Exception as exc:
+                error_code = "upstream_error"
+                error_message = "Invalid JSON from upstream"
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_error", "Invalid JSON from upstream"),
+                    upstream_request_id=upstream_request_id,
+                ) from exc
+            if not isinstance(data, dict):
+                error_code = "upstream_error"
+                error_message = "Unexpected upstream payload"
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_error", error_message),
+                    upstream_request_id=upstream_request_id,
+                )
+            raw_models = data.get("models")
+            if not isinstance(raw_models, list):
+                error_code = "upstream_error"
+                error_message = "Missing 'models' key in upstream response"
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_error", error_message),
+                    upstream_request_id=upstream_request_id,
+                )
+            return CodexModelsResult(
+                payload=cast(dict[str, JsonValue], data),
+                upstream_request_id=upstream_request_id,
+            )
+    except ProxyResponseError as exc:
+        if error_code is None and error_message is None:
+            error_code, error_message = _error_details_from_envelope(exc.payload)
+        if upstream_request_id is None:
+            upstream_request_id = exc.upstream_request_id
+        raise
+    except CircuitBreakerOpenError as exc:
+        error_code = "upstream_unavailable"
+        error_message = "Upstream circuit breaker is open"
+        raise ProxyResponseError(
+            503,
+            openai_error("upstream_unavailable", error_message),
+        ) from exc
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        message = str(exc) or "Request to upstream timed out"
+        error_code = "upstream_unavailable"
+        error_message = message
+        raise ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", message),
+        ) from exc
+    finally:
+        _maybe_log_upstream_request_complete(
+            kind="models",
+            url=url,
+            headers=upstream_headers,
+            method="GET",
+            started_at=started_at,
+            status_code=status_code,
+            error_code=error_code,
+            error_message=error_message,
+            upstream_request_id=upstream_request_id,
+        )
+
+
 async def stream_responses(
     payload: ResponsesRequest,
     headers: Mapping[str, str],
@@ -1710,6 +2101,7 @@ async def stream_responses(
         transport_override=upstream_stream_transport_override,
         model=payload.model,
         headers=headers,
+        has_image_generation_tool=_payload_uses_image_generation_tool(payload_dict),
     )
     if transport == "websocket":
         upstream_headers = _build_upstream_websocket_headers(headers, access_token, account_id)

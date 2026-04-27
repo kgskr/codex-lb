@@ -25,8 +25,10 @@ from app.core.auth.dependencies import (
 from app.core.clients.openai_platform import OpenAIPlatformError
 from app.core.clients.proxy import ProxyResponseError
 from app.core.config.settings import get_settings
-from app.core.errors import OpenAIErrorEnvelope, openai_error
+from app.core.config.settings_cache import get_settings_cache
+from app.core.errors import OpenAIErrorEnvelope, openai_error, response_failed_event
 from app.core.exceptions import ProxyAuthError, ProxyRateLimitError
+from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, bridge_public_contract_error_total
 from app.core.middleware.api_firewall import _parse_trusted_proxy_networks, resolve_connection_client_ip
 from app.core.openai.chat_requests import ChatCompletionsRequest
 from app.core.openai.chat_responses import ChatCompletionResult, collect_chat_completion, stream_chat_chunks
@@ -44,12 +46,13 @@ from app.core.openai.models import (
 from app.core.openai.parsing import parse_response_payload
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRequest
+from app.core.resilience.overload import is_local_overload_error_code, merge_retry_after_headers
 from app.core.runtime_logging import log_error_response
 from app.core.types import JsonValue
 from app.core.usage.types import UsageWindowRow
 from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.request_id import ensure_request_id, get_request_id
-from app.core.utils.sse import parse_sse_data_json
+from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.db.models import Account, AccountStatus, UsageHistory
 from app.db.session import get_background_session
 from app.dependencies import ProxyContext, get_proxy_context, get_proxy_websocket_context
@@ -66,6 +69,8 @@ from app.modules.api_keys.service import (
 from app.modules.firewall.repository import FirewallRepository
 from app.modules.firewall.service import FirewallRepositoryPort, FirewallService
 from app.modules.proxy import service as proxy_service_module
+from app.modules.proxy.helpers import _rate_limit_details
+from app.modules.proxy.http_bridge_forwarding import parse_forwarded_request
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     openai_invalid_payload_error,
@@ -83,6 +88,11 @@ from app.modules.proxy.schemas import (
     V1UsageLimitResponse,
     V1UsageResponse,
 )
+from app.modules.proxy.types import (
+    CreditStatusDetailsData,
+    RateLimitStatusPayloadData,
+    RateLimitWindowSnapshotData,
+)
 from app.modules.upstream_identities.types import (
     BACKEND_CODEX_HTTP_ROUTE_FAMILY,
     CHATGPT_PRIVATE_ROUTE_CLASS,
@@ -95,6 +105,23 @@ from app.modules.upstream_identities.types import (
 from app.modules.usage.repository import UsageRepository
 
 logger = logging.getLogger(__name__)
+
+_PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES = frozenset(
+    {
+        "message",
+        "function_call",
+        "function_call_output",
+        "reasoning",
+        "web_search_call",
+        "file_search_call",
+        "computer_call",
+        "code_interpreter_call",
+        "mcp_approval_request",
+        "mcp_list_tools",
+        "output_image",
+    }
+)
+_PUBLIC_RESPONSE_TEXT_PART_TYPES = frozenset({"output_text", "input_text", "text", "refusal"})
 
 router = APIRouter(
     prefix="/backend-api/codex",
@@ -116,12 +143,17 @@ v1_ws_router = APIRouter(
 )
 usage_router = APIRouter(
     tags=["proxy"],
-    dependencies=[Depends(validate_codex_usage_identity), Depends(set_openai_error_format)],
+    dependencies=[Depends(set_openai_error_format)],
 )
 transcribe_router = APIRouter(
     prefix="/backend-api",
     tags=["proxy"],
     dependencies=[Security(validate_proxy_api_key), Depends(set_openai_error_format)],
+)
+internal_router = APIRouter(
+    prefix="/internal/bridge",
+    tags=["proxy"],
+    dependencies=[Depends(set_openai_error_format)],
 )
 
 _TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
@@ -291,6 +323,56 @@ async def v1_responses(
     )
 
 
+@internal_router.post(
+    "/responses",
+    include_in_schema=False,
+    responses={
+        200: {
+            "content": {
+                "text/event-stream": {
+                    "schema": {"type": "string"},
+                }
+            }
+        }
+    },
+)
+async def internal_bridge_responses(
+    request: Request,
+    payload: ResponsesRequest = Body(...),
+    context: ProxyContext = Depends(get_proxy_context),
+) -> Response:
+    forwarded_request_context, internal_error = parse_forwarded_request(
+        request.headers,
+        payload=payload,
+        current_instance=get_settings().http_responses_session_bridge_instance_id,
+    )
+    if internal_error is not None or forwarded_request_context is None:
+        assert internal_error is not None
+        return _logged_error_json_response(request, internal_error.status_code, internal_error.payload)
+    api_key, auth_error = await _validate_internal_bridge_api_key(request)
+    if auth_error is not None:
+        return auth_error
+    skip_limit_enforcement = api_key is None or forwarded_request_context.context.reservation is not None
+    forwarded_headers = _strip_internal_bridge_headers(request.headers)
+    return await _stream_responses(
+        request,
+        payload,
+        context,
+        api_key,
+        codex_session_affinity=forwarded_request_context.context.codex_session_affinity,
+        openai_cache_affinity=True,
+        prefer_http_bridge=True,
+        skip_limit_enforcement=skip_limit_enforcement,
+        api_key_reservation_override=forwarded_request_context.context.reservation,
+        include_rate_limit_headers=False,
+        forwarded_request=True,
+        forwarded_headers=forwarded_headers,
+        forwarded_downstream_turn_state=forwarded_request_context.context.downstream_turn_state,
+        forwarded_affinity_kind=forwarded_request_context.context.original_affinity_kind,
+        forwarded_affinity_key=forwarded_request_context.context.original_affinity_key,
+    )
+
+
 @v1_ws_router.websocket("/responses")
 async def v1_responses_websocket(
     websocket: WebSocket,
@@ -338,7 +420,7 @@ async def models(
     )
     if platform_response is not None:
         return platform_response
-    return await _build_codex_models_response(api_key)
+    return await _build_codex_models_response(request=request, context=context, api_key=api_key)
 
 
 @v1_router.get("/models", response_model=ModelListResponse)
@@ -430,6 +512,78 @@ def _apply_credit_override(
         model_filter=None,
         reset_at=aggregate_limit.reset_at,
         source="api_key_override",
+    )
+
+
+async def _build_codex_usage_payload_for_api_key(api_key: ApiKeyData) -> RateLimitStatusPayloadData:
+    async with get_background_session() as session:
+        service = ApiKeysService(ApiKeysRepository(session))
+        usage = await service.get_key_usage_summary_for_self(api_key.id)
+
+    if usage is None:
+        raise ProxyAuthError("Invalid API key")
+
+    key_limits = [_to_v1_usage_limit_response(limit) for limit in usage.limits]
+    primary_credit_limit = _select_codex_usage_limit(key_limits, "5h") or _select_codex_usage_limit(key_limits, "daily")
+    secondary_credit_limit = (
+        _select_codex_usage_limit(key_limits, "7d")
+        or _select_codex_usage_limit(key_limits, "weekly")
+        or _select_codex_usage_limit(key_limits, "monthly")
+    )
+
+    return RateLimitStatusPayloadData(
+        plan_type="api_key",
+        rate_limit=_rate_limit_details(
+            _codex_usage_window_snapshot(primary_credit_limit),
+            _codex_usage_window_snapshot(secondary_credit_limit),
+        ),
+        credits=_codex_usage_credit_snapshot(primary_credit_limit, secondary_credit_limit),
+    )
+
+
+def _select_codex_usage_limit(
+    limits: list[V1UsageLimitResponse],
+    window: str,
+) -> V1UsageLimitResponse | None:
+    candidates = [
+        limit
+        for limit in limits
+        if limit.limit_window == window and limit.model_filter is None and limit.limit_type == "credits"
+    ]
+    return candidates[0] if candidates else None
+
+
+def _codex_usage_window_snapshot(limit: V1UsageLimitResponse | None) -> RateLimitWindowSnapshotData | None:
+    if limit is None or limit.max_value <= 0:
+        return None
+    reset_at = datetime.fromisoformat(limit.reset_at.replace("Z", "+00:00"))
+    reset_epoch = int(reset_at.timestamp())
+    now_epoch = int(time.time())
+    used_percent = max(0, min(100, int((limit.current_value / limit.max_value) * 100)))
+    window_seconds = {"5h": 18000, "daily": 86400, "7d": 604800, "weekly": 604800, "monthly": 2592000}.get(
+        limit.limit_window
+    )
+    return RateLimitWindowSnapshotData(
+        used_percent=used_percent,
+        limit_window_seconds=window_seconds,
+        reset_after_seconds=max(0, reset_epoch - now_epoch),
+        reset_at=reset_epoch,
+    )
+
+
+def _codex_usage_credit_snapshot(
+    primary_limit: V1UsageLimitResponse | None,
+    secondary_limit: V1UsageLimitResponse | None,
+) -> CreditStatusDetailsData | None:
+    preferred = secondary_limit or primary_limit
+    if preferred is None or preferred.limit_type != "credits":
+        return None
+    return CreditStatusDetailsData(
+        has_credits=preferred.remaining_value > 0,
+        unlimited=False,
+        balance=str(preferred.remaining_value),
+        approx_local_messages=None,
+        approx_cloud_messages=None,
     )
 
 
@@ -542,29 +696,80 @@ async def v1_audio_transcriptions(
     )
 
 
-async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
-    reservation = await _enforce_request_limits(
-        api_key,
-        request_model=None,
-        request_service_tier=None,
-    )
-
+def _build_registry_codex_models_payload(api_key: ApiKeyData | None) -> CodexModelsResponse:
     allowed_models = _allowed_models_for_api_key(api_key)
-
     registry = get_model_registry()
     models = registry.get_models_with_fallback()
-
     if not models:
-        await _release_reservation(reservation)
-        return JSONResponse(content=CodexModelsResponse(models=[]).model_dump(mode="json"))
+        return CodexModelsResponse(models=[])
 
     entries: list[CodexModelEntry] = []
     for slug, model in models.items():
         if not is_public_model(model, allowed_models):
             continue
         entries.append(_to_codex_model_entry(model))
-    await _release_reservation(reservation)
-    return JSONResponse(content=CodexModelsResponse(models=entries).model_dump(mode="json"))
+    return CodexModelsResponse(models=entries)
+
+
+def _build_live_codex_models_payload(
+    payload: Mapping[str, JsonValue],
+    *,
+    api_key: ApiKeyData | None,
+) -> CodexModelsResponse:
+    allowed_models = _allowed_models_for_api_key(api_key)
+    raw_items = payload.get("models")
+    if not isinstance(raw_items, list):
+        return CodexModelsResponse(models=[])
+
+    context_window_overrides = get_settings().model_context_window_overrides
+    entries: list[CodexModelEntry] = []
+    for item in raw_items:
+        if not is_json_mapping(item):
+            continue
+        slug = item.get("slug")
+        if not isinstance(slug, str) or not slug:
+            continue
+        if allowed_models is not None and slug not in allowed_models:
+            continue
+        raw_entry = dict(item)
+        override_context_window = context_window_overrides.get(slug)
+        if override_context_window is not None:
+            raw_entry["context_window"] = override_context_window
+        try:
+            entries.append(CodexModelEntry.model_validate(raw_entry))
+        except ValidationError:
+            logger.warning("Failed to parse live upstream Codex model entry slug=%s", slug, exc_info=True)
+            continue
+    return CodexModelsResponse(models=entries)
+
+
+async def _build_codex_models_response(
+    *,
+    request: Request,
+    context: ProxyContext,
+    api_key: ApiKeyData | None,
+) -> Response:
+    reservation = await _enforce_request_limits(
+        api_key,
+        request_model=None,
+        request_service_tier=None,
+    )
+    try:
+        live_response = await context.service.fetch_chatgpt_codex_models(
+            api_key,
+            headers=request.headers,
+        )
+        if live_response is not None:
+            content = _build_live_codex_models_payload(
+                live_response.payload,
+                api_key=api_key,
+            ).model_dump(mode="json")
+            return JSONResponse(content=content)
+
+        content = _build_registry_codex_models_payload(api_key).model_dump(mode="json")
+        return JSONResponse(content=content)
+    finally:
+        await _release_reservation(reservation)
 
 
 async def _build_models_response(api_key: ApiKeyData | None) -> Response:
@@ -791,13 +996,13 @@ async def v1_chat_completions(
             rejection_reason="chat_completions_platform_unsupported",
         )
         return _logged_error_json_response(request, 400, error, headers=rate_limit_headers)
-    reservation = await _enforce_request_limits(
-        api_key,
-        request_model=effective_model,
-        request_service_tier=responses_payload.service_tier,
-    )
     responses_payload.stream = True
     apply_api_key_enforcement(responses_payload, api_key)
+    reservation = await _enforce_request_limits(
+        api_key,
+        request_model=responses_payload.model,
+        request_service_tier=responses_payload.service_tier,
+    )
     stream = context.service.stream_responses(
         responses_payload,
         request.headers,
@@ -853,19 +1058,37 @@ async def _stream_responses(
     openai_cache_affinity: bool = False,
     suppress_text_done_events: bool = False,
     prefer_http_bridge: bool = False,
+    skip_limit_enforcement: bool = False,
+    api_key_reservation_override: ApiKeyUsageReservationData | None = None,
+    include_rate_limit_headers: bool = True,
+    forwarded_request: bool = False,
+    forwarded_headers: Mapping[str, str] | None = None,
+    forwarded_downstream_turn_state: str | None = None,
+    forwarded_affinity_kind: str | None = None,
+    forwarded_affinity_key: str | None = None,
 ) -> Response:
     apply_api_key_enforcement(payload, api_key)
     validate_model_access(api_key, payload.model)
-    reservation = await _enforce_request_limits(
-        api_key,
-        request_model=payload.model,
-        request_service_tier=payload.service_tier,
+    owns_reservation = api_key_reservation_override is None
+    reservation = (
+        api_key_reservation_override
+        if skip_limit_enforcement
+        else await _enforce_request_limits(
+            api_key,
+            request_model=payload.model,
+            request_service_tier=payload.service_tier,
+        )
     )
 
-    rate_limit_headers = await context.service.rate_limit_headers()
+    rate_limit_headers = await context.service.rate_limit_headers() if include_rate_limit_headers else {}
     bridge_active = prefer_http_bridge and proxy_service_module.get_settings().http_responses_session_bridge_enabled
+    effective_headers = forwarded_headers or request.headers
     downstream_turn_state = (
-        proxy_service_module.ensure_http_downstream_turn_state(request.headers) if bridge_active else None
+        forwarded_downstream_turn_state
+        if bridge_active and forwarded_downstream_turn_state is not None
+        else proxy_service_module.ensure_http_downstream_turn_state(effective_headers)
+        if bridge_active
+        else None
     )
     turn_state_headers = (
         proxy_service_module.build_downstream_turn_state_response_headers(downstream_turn_state)
@@ -876,7 +1099,7 @@ async def _stream_responses(
     if prefer_http_bridge:
         stream = context.service.stream_http_responses(
             payload,
-            request.headers,
+            effective_headers,
             codex_session_affinity=codex_session_affinity,
             propagate_http_errors=True,
             openai_cache_affinity=openai_cache_affinity,
@@ -884,6 +1107,9 @@ async def _stream_responses(
             api_key_reservation=reservation,
             suppress_text_done_events=suppress_text_done_events,
             downstream_turn_state=downstream_turn_state,
+            forwarded_request=forwarded_request,
+            forwarded_affinity_kind=forwarded_affinity_kind,
+            forwarded_affinity_key=forwarded_affinity_key,
         )
     else:
         stream = context.service.stream_responses(
@@ -896,6 +1122,7 @@ async def _stream_responses(
             api_key_reservation=reservation,
             suppress_text_done_events=suppress_text_done_events,
         )
+    stream = _normalize_public_responses_stream(stream)
     try:
         first = await stream.__anext__()
     except StopAsyncIteration:
@@ -905,7 +1132,8 @@ async def _stream_responses(
             headers={"Cache-Control": "no-cache", **rate_limit_headers},
         )
     except ProxyResponseError as exc:
-        await _release_reservation(reservation)
+        if owns_reservation:
+            await _release_reservation(reservation)
         return _logged_error_json_response(
             request,
             exc.status_code,
@@ -917,6 +1145,10 @@ async def _stream_responses(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", **turn_state_headers, **rate_limit_headers},
     )
+
+
+def _strip_internal_bridge_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    return {key: value for key, value in headers.items() if not key.lower().startswith("x-codex-bridge-")}
 
 
 async def _collect_responses(
@@ -1224,8 +1456,13 @@ async def _transcribe_request(
 @usage_router.get("/api/codex/usage/", response_model=RateLimitStatusPayload, include_in_schema=False)
 async def codex_usage(
     context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Depends(validate_codex_usage_identity),
 ) -> RateLimitStatusPayload:
-    payload = await context.service.get_rate_limit_payload()
+    payload = (
+        await _build_codex_usage_payload_for_api_key(api_key)
+        if api_key is not None
+        else await context.service.get_rate_limit_payload()
+    )
     return RateLimitStatusPayload.from_data(payload)
 
 
@@ -1514,10 +1751,11 @@ async def _maybe_handle_platform_responses(
     validate_model_access(api_key, payload.model)
     reasoning_effort = payload.reasoning.effort if payload.reasoning else None
     requested_service_tier = _normalize_service_tier_value(payload.service_tier)
+    forwarded_service_tier = payload.platform_forwarded_service_tier()
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
-        request_service_tier=payload.service_tier,
+        request_service_tier=forwarded_service_tier,
     )
     rate_limit_headers = await context.service.rate_limit_headers()
     request_id = ensure_request_id()
@@ -1595,7 +1833,7 @@ async def _maybe_handle_platform_responses(
                 error_code="upstream_unavailable",
                 error_message=str(exc) or "Failed to receive the initial OpenAI Platform streaming response.",
                 reasoning_effort=reasoning_effort,
-                service_tier=requested_service_tier,
+                service_tier=forwarded_service_tier,
                 requested_service_tier=requested_service_tier,
                 route_class=route_class,
                 rejection_reason="platform_stream_start_failed",
@@ -1631,6 +1869,7 @@ async def _maybe_handle_platform_responses(
             route_class=route_class,
             reasoning_effort=reasoning_effort,
             requested_service_tier=requested_service_tier,
+            forwarded_service_tier=forwarded_service_tier,
         )
         return StreamingResponse(
             stream,
@@ -1706,7 +1945,7 @@ async def _maybe_handle_platform_responses(
         reasoning_tokens=reasoning_tokens,
         reasoning_effort=reasoning_effort,
         transport="http",
-        service_tier=_effective_service_tier(requested_service_tier, actual_service_tier),
+        service_tier=_effective_service_tier(forwarded_service_tier, actual_service_tier),
         requested_service_tier=requested_service_tier,
         actual_service_tier=actual_service_tier,
         route_class=route_class,
@@ -1780,6 +2019,7 @@ async def _instrument_platform_stream(
     route_class: str,
     reasoning_effort: str | None,
     requested_service_tier: str | None,
+    forwarded_service_tier: str | None,
 ) -> AsyncIterator[str]:
     status = "success"
     error_code: str | None = None
@@ -1846,7 +2086,7 @@ async def _instrument_platform_stream(
             reasoning_tokens=reasoning_tokens,
             reasoning_effort=reasoning_effort,
             transport="http",
-            service_tier=_effective_service_tier(requested_service_tier, actual_service_tier),
+            service_tier=_effective_service_tier(forwarded_service_tier, actual_service_tier),
             requested_service_tier=requested_service_tier,
             actual_service_tier=actual_service_tier,
             route_class=route_class,
@@ -2013,6 +2253,9 @@ def _logged_error_json_response(
     upstream_request_id: str | None = None,
 ) -> JSONResponse:
     code, message = _error_details_from_content(content)
+    effective_headers = dict(headers or {})
+    if status_code == 429 and is_local_overload_error_code(code):
+        effective_headers = merge_retry_after_headers(effective_headers)
     log_error_response(
         logger,
         request,
@@ -2026,7 +2269,7 @@ def _logged_error_json_response(
         rejection_reason=rejection_reason,
         upstream_request_id=upstream_request_id,
     )
-    return JSONResponse(status_code=status_code, content=content, headers=headers)
+    return JSONResponse(status_code=status_code, content=content, headers=effective_headers or None)
 
 
 def _error_details_from_content(
@@ -2062,6 +2305,25 @@ async def _validate_proxy_websocket_request(
             )
         else:
             api_key = await validate_proxy_api_key_authorization(websocket.headers.get("authorization"))
+    except ProxyAuthError as exc:
+        return None, JSONResponse(
+            status_code=exc.status_code,
+            content=openai_error(exc.code, exc.message, error_type=exc.error_type),
+        )
+    return api_key, None
+
+
+async def _validate_internal_bridge_api_key(
+    request: Request,
+) -> tuple[ApiKeyData | None, JSONResponse | None]:
+    dashboard_settings = await get_settings_cache().get()
+    if not dashboard_settings.api_key_auth_enabled:
+        return None, None
+    try:
+        api_key = await validate_proxy_api_key_authorization(
+            request.headers.get("authorization"),
+            request=request,
+        )
     except ProxyAuthError as exc:
         return None, JSONResponse(
             status_code=exc.status_code,
@@ -2146,9 +2408,12 @@ def _compact_request_service_tier(payload: ResponsesCompactRequest) -> str | Non
 async def _collect_responses_payload(stream: AsyncIterator[str]) -> OpenAIResponseResult:
     output_items: dict[int, dict[str, JsonValue]] = {}
     terminal_result: OpenAIResponseResult | None = None
+    contract_violation_kind: str | None = None
     async for line in stream:
         payload = _parse_sse_payload(line)
         if not payload:
+            if _looks_like_sse_data_block(line):
+                contract_violation_kind = contract_violation_kind or "invalid_json"
             continue
         event_type = payload.get("type")
         _collect_output_item_event(payload, output_items)
@@ -2176,16 +2441,30 @@ async def _collect_responses_payload(stream: AsyncIterator[str]) -> OpenAIRespon
             continue
         if event_type in ("response.completed", "response.incomplete"):
             response = payload.get("response")
-            if isinstance(response, dict):
-                parsed = parse_response_payload(_merge_collected_output_items(response, output_items))
+            if is_json_mapping(response):
+                normalized_response, violation_kind = _normalize_public_response_mapping(response, output_items)
+                if violation_kind is not None:
+                    contract_violation_kind = contract_violation_kind or violation_kind
+                if normalized_response is not None:
+                    parsed = parse_response_payload(normalized_response)
+                else:
+                    parsed = None
                 if parsed is not None:
                     terminal_result = parsed
                     continue
-            terminal_result = _default_error_envelope()
+            error_kind = contract_violation_kind or "invalid_json"
+            terminal_result = _public_contract_error_envelope(
+                error_kind,
+                _public_contract_error_message(error_kind),
+            )
 
     if terminal_result is not None:
         return terminal_result
-    return _default_error_envelope()
+    error_kind = contract_violation_kind or "upstream_stream_truncated"
+    return _public_contract_error_envelope(
+        error_kind,
+        _public_contract_error_message(error_kind),
+    )
 
 
 def _collect_output_item_event(
@@ -2216,6 +2495,210 @@ def _merge_collected_output_items(
 
     merged["output"] = [item for _, item in sorted(output_items.items())]
     return merged
+
+
+async def _normalize_public_responses_stream(stream: AsyncIterator[str]) -> AsyncIterator[str]:
+    terminal_seen = False
+    contract_violation_kind: str | None = None
+    async for event_block in stream:
+        if event_block.strip() == "data: [DONE]":
+            if terminal_seen:
+                yield event_block
+            continue
+        payload = _parse_sse_payload(event_block)
+        if payload is None:
+            if _looks_like_sse_data_block(event_block):
+                contract_violation_kind = contract_violation_kind or "invalid_json"
+            continue
+        normalized_payload, violation_kind = _normalize_public_stream_payload(payload)
+        if violation_kind is not None:
+            contract_violation_kind = contract_violation_kind or violation_kind
+        if normalized_payload is None:
+            continue
+        event_type = normalized_payload.get("type")
+        if isinstance(event_type, str) and event_type in {
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+            "error",
+        }:
+            terminal_seen = True
+        yield format_sse_event(normalized_payload)
+    if terminal_seen:
+        return
+    error_kind = contract_violation_kind or "upstream_stream_truncated"
+    yield format_sse_event(
+        response_failed_event(
+            error_kind,
+            _public_contract_error_message(error_kind),
+        )
+    )
+
+
+def _normalize_public_stream_payload(
+    payload: dict[str, JsonValue],
+) -> tuple[dict[str, JsonValue] | None, str | None]:
+    event_type = payload.get("type")
+    if event_type in ("response.completed", "response.incomplete"):
+        response = payload.get("response")
+        if not is_json_mapping(response):
+            return (
+                cast(
+                    dict[str, JsonValue],
+                    response_failed_event(
+                        "invalid_json",
+                        _public_contract_error_message("invalid_json"),
+                    ),
+                ),
+                "invalid_json",
+            )
+        normalized_response, violation_kind = _normalize_public_response_mapping(response)
+        if normalized_response is None:
+            error_kind = violation_kind or "invalid_output_item"
+            return (
+                cast(
+                    dict[str, JsonValue],
+                    response_failed_event(
+                        error_kind,
+                        _public_contract_error_message(error_kind),
+                    ),
+                ),
+                error_kind,
+            )
+        normalized_payload = dict(payload)
+        normalized_payload["response"] = normalized_response
+        return normalized_payload, violation_kind
+    if event_type in ("response.output_item.added", "response.output_item.done"):
+        item = payload.get("item")
+        if not is_json_mapping(item):
+            return None, "invalid_output_item"
+        normalized_item = _normalize_public_output_item(item)
+        if normalized_item is None:
+            return None, "invalid_output_item"
+        normalized_payload = dict(payload)
+        normalized_payload["item"] = normalized_item
+        violation_kind = None
+        item_type = item.get("type")
+        if isinstance(item_type, str) and not _is_public_passthrough_output_item_type(item_type):
+            violation_kind = "invalid_output_item"
+        return normalized_payload, violation_kind
+    return payload, None
+
+
+def _normalize_public_response_mapping(
+    response: Mapping[str, JsonValue],
+    output_items: dict[int, dict[str, JsonValue]] | None = None,
+) -> tuple[dict[str, JsonValue] | None, str | None]:
+    merged = _merge_collected_output_items(response, output_items or {})
+    output = merged.get("output")
+    if not isinstance(output, list):
+        return merged, None
+    normalized_output: list[JsonValue] = []
+    dropped_items = 0
+    for item in output:
+        if not is_json_mapping(item):
+            dropped_items += 1
+            continue
+        normalized_item = _normalize_public_output_item(item)
+        if normalized_item is None:
+            dropped_items += 1
+            continue
+        normalized_output.append(normalized_item)
+    if output and not normalized_output:
+        _record_public_contract_violation("invalid_output_item")
+        return None, "invalid_output_item"
+    normalized = dict(merged)
+    normalized["output"] = normalized_output
+    if dropped_items:
+        _record_public_contract_violation("invalid_output_item")
+        return normalized, "invalid_output_item"
+    return normalized, None
+
+
+def _normalize_public_output_item(item: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+    item_type = item.get("type")
+    if isinstance(item_type, str) and _is_public_passthrough_output_item_type(item_type):
+        return dict(item)
+    text_value = _extract_public_output_item_text(item)
+    if text_value is None:
+        return None
+    normalized: dict[str, JsonValue] = {
+        "type": "message",
+        "role": "assistant",
+        "status": item.get("status") if isinstance(item.get("status"), str) else "completed",
+        "content": [{"type": "output_text", "text": text_value}],
+    }
+    item_id = item.get("id")
+    if isinstance(item_id, str) and item_id:
+        normalized["id"] = item_id
+    return normalized
+
+
+def _is_public_passthrough_output_item_type(item_type: str) -> bool:
+    if item_type in _PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES:
+        return True
+    return item_type.endswith("_call") or item_type.endswith("_call_output")
+
+
+def _extract_public_output_item_text(item: Mapping[str, JsonValue]) -> str | None:
+    direct_text = item.get("text")
+    if isinstance(direct_text, str) and direct_text:
+        return direct_text
+    content = item.get("content")
+    if is_json_mapping(content):
+        content_parts: list[Mapping[str, JsonValue]] = [content]
+    elif isinstance(content, list):
+        content_parts = [part for part in content if is_json_mapping(part)]
+    else:
+        content_parts = []
+    parts: list[str] = []
+    for part in content_parts:
+        part_type = part.get("type")
+        if isinstance(part_type, str) and part_type in _PUBLIC_RESPONSE_TEXT_PART_TYPES:
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+                continue
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+    if parts:
+        return "".join(parts)
+    summary = item.get("summary")
+    if isinstance(summary, str) and summary:
+        return summary
+    return None
+
+
+def _looks_like_sse_data_block(event_block: str) -> bool:
+    return "data:" in event_block
+
+
+def _public_contract_error_message(kind: str) -> str:
+    if kind == "invalid_json":
+        return "Responses stream produced an invalid JSON payload"
+    if kind == "invalid_output_item":
+        return "Responses stream produced unsupported output items"
+    if kind == "upstream_stream_truncated":
+        return "Responses stream ended before a terminal event"
+    return "Responses stream violated the public contract"
+
+
+def _public_contract_error_envelope(kind: str, message: str) -> OpenAIErrorEnvelopeModel:
+    _record_public_contract_violation(kind)
+    return OpenAIErrorEnvelopeModel(
+        error=OpenAIError(
+            message=message,
+            type="server_error",
+            code=kind,
+        )
+    )
+
+
+def _record_public_contract_violation(kind: str) -> None:
+    logger.warning("bridge_public_contract_violation kind=%s", kind)
+    if PROMETHEUS_AVAILABLE and bridge_public_contract_error_total is not None:
+        bridge_public_contract_error_total.labels(kind=kind).inc()
 
 
 def _parse_event_error_envelope(payload: dict[str, JsonValue]) -> OpenAIErrorEnvelopeModel:

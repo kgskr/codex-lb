@@ -5,7 +5,11 @@ import json
 
 import pytest
 
+import app.modules.proxy.api as proxy_api_module
 import app.modules.proxy.service as proxy_module
+from app.db.session import SessionLocal
+from app.modules.api_keys.repository import ApiKeysRepository
+from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService
 
 pytestmark = pytest.mark.integration
 
@@ -50,6 +54,20 @@ async def _import_account(async_client, account_id: str, email: str) -> None:
     files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
     response = await async_client.post("/api/accounts/import", files=files)
     assert response.status_code == 200
+
+
+async def _create_api_key(*, name: str, enforced_service_tier: str | None = None) -> tuple[str, str]:
+    async with SessionLocal() as session:
+        service = ApiKeysService(ApiKeysRepository(session))
+        created = await service.create_key(
+            ApiKeyCreateData(
+                name=name,
+                allowed_models=None,
+                enforced_service_tier=enforced_service_tier,
+                expires_at=None,
+            )
+        )
+    return created.id, created.key
 
 
 def _completed_event(response_id: str) -> str:
@@ -348,10 +366,13 @@ async def test_v1_responses_rejects_invalid_include(async_client):
 
 
 @pytest.mark.asyncio
-async def test_v1_responses_rejects_store_true(async_client):
+async def test_v1_responses_coerces_store_true_to_false(async_client):
+    """store=true should be silently coerced to false (not rejected) so the
+    bridge path can later override it on the upstream payload."""
     payload = {"model": "gpt-5.2", "input": "hi", "store": True}
     resp = await async_client.post("/v1/responses", json=payload)
-    assert resp.status_code == 400
+    # 503 means it passed validation (no 400) but there are no upstream accounts in test
+    assert resp.status_code != 400
 
 
 @pytest.mark.asyncio
@@ -713,6 +734,56 @@ async def test_v1_chat_completions_forwards_service_tier(async_client, monkeypat
     }
     resp = await async_client.post("/v1/chat/completions", json=payload)
     assert resp.status_code == 200
+    assert seen["payload"].service_tier == "priority"
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_reserves_enforced_service_tier(async_client, monkeypatch):
+    await _import_account(async_client, "acc_chat_enforced_service_tier", "chat-enforced-service-tier@example.com")
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+    key_id, plain_key = await _create_api_key(
+        name="chat-enforced-service-tier",
+        enforced_service_tier="priority",
+    )
+
+    seen = {}
+
+    async def fake_enforce(api_key, *, request_model, request_service_tier):
+        seen["api_key_id"] = api_key.id if api_key is not None else None
+        seen["request_model"] = request_model
+        seen["request_service_tier"] = request_service_tier
+        return None
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload
+        yield _completed_event("resp_chat_enforced_service_tier")
+
+    monkeypatch.setattr(proxy_api_module, "_enforce_request_limits", fake_enforce)
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "Use the enforced tier."}],
+        "service_tier": "flex",
+    }
+    resp = await async_client.post(
+        "/v1/chat/completions",
+        json=payload,
+        headers={"Authorization": f"Bearer {plain_key}"},
+    )
+    assert resp.status_code == 200
+    assert seen["api_key_id"] == key_id
+    assert seen["request_model"] == "gpt-5.2"
+    assert seen["request_service_tier"] == "priority"
     assert seen["payload"].service_tier == "priority"
 
 

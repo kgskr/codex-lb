@@ -45,11 +45,7 @@ macOS / Linux:
 python3.13 -m venv .venv
 source .venv/bin/activate
 pip install codex-lb-cinamon
-codex-lb-cinamon start
-#동작상태 확인
-codex-lb-cinamon status
-#종료시
-codex-lb-cinamon shutdown
+codex-lb-cinamon --host 127.0.0.1 --port 2455
 ```
 
 Windows PowerShell:
@@ -58,12 +54,38 @@ Windows PowerShell:
 py -3.13 -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install codex-lb-cinamon
-codex-lb-cinamon start
-# 동작 상태 확인
-codex-lb-cinamon status
-# 종료 시
-codex-lb-cinamon shutdown
+codex-lb-cinamon --host 127.0.0.1 --port 2455
 ```
+
+원하면 `--host`, `--port`, `--ssl-certfile`, `--ssl-keyfile`를 함께 줄 수 있습니다. 서버는 foreground 로 실행되고 로그는 표준 출력으로 바로 확인할 수 있습니다.
+
+## Remote Setup
+
+원격에서 처음 대시보드 비밀번호를 설정할 때는 bootstrap token이 필요합니다.
+
+자동 생성(기본):
+
+```bash
+docker logs codex-lb-cinamon
+# ============================================
+#   Dashboard bootstrap token (first-run):
+#   <token>
+# ============================================
+```
+
+비밀번호가 아직 없고 `CODEX_LB_DASHBOARD_BOOTSTRAP_TOKEN` 을 지정하지 않았다면 서버가 1회용 bootstrap token을 생성해 로그에 남깁니다. 여러 replica가 같은 암호화 키를 사용하면 재시작 뒤에도 같은 토큰을 복구해 다시 로그로 확인할 수 있습니다.
+
+수동 지정:
+
+```bash
+docker run -d --name codex-lb-cinamon \
+  -e CODEX_LB_DASHBOARD_BOOTSTRAP_TOKEN=your-secret-token \
+  -p 2455:2455 -p 1455:1455 \
+  -v codex-lb-cinamon-data:/var/lib/codex-lb \
+  ghcr.io/cinev/codex-lb-cinamon:latest
+```
+
+`localhost` 나 host-OS bypass 로 분류되는 요청은 bootstrap token 없이도 초기 설정을 진행할 수 있습니다.
 
 DB 마이그레이션을 수동으로 실행해야 하면:
 
@@ -92,24 +114,7 @@ docker run -d --name codex-lb-cinamon \
 uvx codex-lb-cinamon
 ```
 
-포그라운드로 명시 실행:
-
-```bash
-codex-lb-cinamon serve
-```
-
-
-
-기본 PID 파일과 로그 파일은 아래 경로를 사용합니다.
-
-```text
-macOS / Linux: ~/.codex-lb/server.pid
-macOS / Linux: ~/.codex-lb/server.log
-Windows: %USERPROFILE%\.codex-lb\server.pid
-Windows: %USERPROFILE%\.codex-lb\server.log
-```
-
-원하면 `start`에 `--pid-file`, `--log-file`, `--host`, `--port`를 함께 줄 수 있습니다.
+명령은 foreground 서버를 바로 띄우며, 필요하면 추가 인자를 그대로 넘길 수 있습니다.
 
 컨테이너로 실행할 때는 아래 설정을 함께 주는 것을 권장합니다.
 
@@ -250,6 +255,10 @@ codex
 <details>
 <summary><b>OpenCode</b></summary>
 
+Before starting, please ensure that all existing OpenAI credentials is cleared in `~/.local/share/opencode/auth.json`
+You can clean the config by using this one-liner
+`jq 'del(.openai)' ~/.local/share/opencode/auth.json > auth.json.tmp && mv auth.json.tmp ~/.local/share/opencode/auth.json`
+
 `~/.config/opencode/opencode.json`:
 
 ```jsonc
@@ -338,6 +347,7 @@ opencode
 }
 ```
 
+`CODEX_LB_API_KEY` 환경 변수를 쓰거나 `${CODEX_LB_API_KEY}` 자리에 대시보드에서 발급한 키를 넣으면 됩니다. API 키 인증이 꺼져 있어도 비로컬 요청은 proxy 인증이 준비되기 전까지 거절될 수 있습니다.
 </details>
 
 <details>
@@ -348,7 +358,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:2455/v1",
-    api_key="sk-clb-...",  # 인증을 끄면 아무 문자열이어도 됩니다.
+    api_key="sk-clb-...",  # 대시보드에서 발급한 키. 인증이 꺼져 있으면 아무 non-empty 문자열도 가능
 )
 
 response = client.chat.completions.create(
@@ -363,7 +373,7 @@ print(response.choices[0].message.content)
 
 ## API 키 인증(Codex LB 인증용, Platform API key가 아님.)
 
-API 키 인증은 기본적으로 꺼져 있습니다. 켜려면 대시보드의 `Settings -> API Key Auth` 에서 활성화하면 됩니다.
+API 키 인증은 기본적으로 꺼져 있습니다. 이 상태에서는 보호된 프록시 라우트에 대해 로컬 요청만 키 없이 통과하고, 비로컬 요청은 proxy 인증이 준비될 때까지 거절됩니다. Docker, VM, 원격 네트워크처럼 서비스가 비로컬로 인식하는 환경에서 붙는 클라이언트는 보통 대시보드의 `Settings -> API Key Auth` 에서 이 기능을 켜고 키를 사용해야 합니다.
 
 활성화 후에는 모든 클라이언트 요청이 다음 형식을 따라야 합니다.
 
@@ -371,7 +381,15 @@ API 키 인증은 기본적으로 꺼져 있습니다. 켜려면 대시보드의
 Authorization: Bearer sk-clb-...
 ```
 
-API 키는 `Dashboard -> API Keys -> Create` 에서 발급합니다. 전체 키 값은 생성 시 한 번만 표시됩니다.
+적용 라우트:
+
+- `/v1/*`
+- `/backend-api/codex/*`
+- `/backend-api/transcribe`
+
+`/api/codex/usage` 는 별도 caller-identity 경로라 대시보드 세션만으로는 접근할 수 없습니다.
+
+API 키는 `Dashboard -> API Keys -> Create` 에서 발급하며, 전체 키 값은 생성 시 한 번만 표시됩니다.
 
 지원 항목:
 
@@ -386,6 +404,30 @@ API 키는 `Dashboard -> API Keys -> Create` 에서 발급합니다. 전체 키 
 - 예시는 `.env.example` 에 있습니다.
 - 대시보드 인증 설정은 UI에서 변경할 수 있습니다.
 - 기본 DB는 SQLite이며, `CODEX_LB_DATABASE_URL` 을 주면 PostgreSQL도 사용할 수 있습니다.
+
+### 대시보드 인증 모드
+
+`codex-lb-cinamon` 은 다음 3가지 대시보드 인증 모드를 지원합니다.
+
+- `CODEX_LB_DASHBOARD_AUTH_MODE=standard`
+  - 기본 내장 비밀번호 인증과 선택형 TOTP를 사용합니다.
+- `CODEX_LB_DASHBOARD_AUTH_MODE=trusted_header`
+  - 리버스 프록시가 주입한 인증 헤더를 신뢰합니다.
+  - `CODEX_LB_FIREWALL_TRUST_PROXY_HEADERS=true`, `CODEX_LB_FIREWALL_TRUSTED_PROXY_CIDRS`, `CODEX_LB_DASHBOARD_AUTH_PROXY_HEADER` 설정이 함께 필요합니다.
+  - 내장 비밀번호/TOTP는 fallback 으로 계속 둘 수 있습니다.
+- `CODEX_LB_DASHBOARD_AUTH_MODE=disabled`
+  - 앱 레벨 대시보드 인증을 완전히 우회합니다.
+  - 외부 인증이나 네트워크 제한이 있는 환경에서만 쓰는 것이 안전합니다.
+
+`trusted_header` 예시:
+
+```bash
+CODEX_LB_FIREWALL_TRUST_PROXY_HEADERS=true
+CODEX_LB_FIREWALL_TRUSTED_PROXY_CIDRS=172.18.0.0/16
+CODEX_LB_DASHBOARD_AUTH_PROXY_HEADER=Remote-User
+```
+
+신뢰 헤더가 없고 fallback 비밀번호도 설정되지 않았다면 대시보드는 fail-closed 로 동작합니다.
 
 ## 데이터 위치
 

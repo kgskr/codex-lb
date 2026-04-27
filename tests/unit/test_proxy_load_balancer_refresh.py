@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -39,6 +39,8 @@ from app.modules.upstream_identities.repository import OpenAIPlatformIdentitiesR
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
 pytestmark = pytest.mark.unit
+
+_UNSET = object()
 
 
 def _make_account(account_id: str, email: str = "a@example.com") -> Account:
@@ -77,6 +79,7 @@ class StubAccountsRepository(AccountsRepository):
         status: AccountStatus,
         deactivation_reason: str | None = None,
         reset_at: int | None = None,
+        blocked_at: int | None | object = _UNSET,
     ) -> bool:
         account = self._find_account(account_id)
         if account is None:
@@ -84,12 +87,15 @@ class StubAccountsRepository(AccountsRepository):
         account.status = status
         account.deactivation_reason = deactivation_reason
         account.reset_at = reset_at
+        if blocked_at is not _UNSET:
+            account.blocked_at = cast("int | None", blocked_at)
         self.status_updates.append(
             {
                 "account_id": account_id,
                 "status": status,
                 "deactivation_reason": deactivation_reason,
                 "reset_at": reset_at,
+                "blocked_at": blocked_at,
             }
         )
         return True
@@ -100,10 +106,12 @@ class StubAccountsRepository(AccountsRepository):
         status: AccountStatus,
         deactivation_reason: str | None = None,
         reset_at: int | None = None,
+        blocked_at: int | None | object = _UNSET,
         *,
         expected_status: AccountStatus,
         expected_deactivation_reason: str | None = None,
         expected_reset_at: int | None = None,
+        expected_blocked_at: int | None | object = _UNSET,
     ) -> bool:
         account = self._find_account(account_id)
         if account is None:
@@ -112,9 +120,10 @@ class StubAccountsRepository(AccountsRepository):
             account.status != expected_status
             or account.deactivation_reason != expected_deactivation_reason
             or account.reset_at != expected_reset_at
+            or (expected_blocked_at is not _UNSET and account.blocked_at != expected_blocked_at)
         ):
             return False
-        return await self.update_status(account_id, status, deactivation_reason, reset_at)
+        return await self.update_status(account_id, status, deactivation_reason, reset_at, blocked_at)
 
 
 class StubUsageRepository(UsageRepository):
@@ -313,6 +322,68 @@ async def test_select_account_reads_cached_usage_once_per_window() -> None:
     assert selection.account.id == account.id
     assert usage_repo.primary_calls == 1
     assert usage_repo.secondary_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_select_account_prefers_budget_safe_account_when_any_exist() -> None:
+    safe_account = _make_account("acc-safe", "safe@example.com")
+    pressured_account = _make_account("acc-pressured", "pressured@example.com")
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    primary = {
+        safe_account.id: UsageHistory(
+            id=1,
+            account_id=safe_account.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=10.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+        pressured_account.id: UsageHistory(
+            id=2,
+            account_id=pressured_account.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=99.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+    }
+    secondary = {
+        safe_account.id: UsageHistory(
+            id=3,
+            account_id=safe_account.id,
+            recorded_at=now,
+            window="secondary",
+            used_percent=80.0,
+            reset_at=now_epoch + 3600,
+            window_minutes=60,
+        ),
+        pressured_account.id: UsageHistory(
+            id=4,
+            account_id=pressured_account.id,
+            recorded_at=now,
+            window="secondary",
+            used_percent=5.0,
+            reset_at=now_epoch + 3600,
+            window_minutes=60,
+        ),
+    }
+
+    accounts_repo = StubAccountsRepository([safe_account, pressured_account])
+    usage_repo = StubUsageRepository(primary=primary, secondary=secondary)
+    sticky_repo = StubStickySessionsRepository()
+
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+    selection = await balancer.select_account(
+        routing_strategy="usage_weighted",
+        budget_threshold_pct=95.0,
+    )
+
+    assert selection.account is not None
+    assert selection.account.id == safe_account.id
 
 
 @pytest.mark.asyncio
@@ -999,6 +1070,7 @@ async def test_mark_quota_exceeded_keeps_selection_blocked_until_persisted(monke
         status: AccountStatus,
         deactivation_reason: str | None = None,
         reset_at: int | None = None,
+        blocked_at: int | None | object = _UNSET,
     ) -> bool:
         persist_started.set()
         await release_persist.wait()
@@ -1008,6 +1080,7 @@ async def test_mark_quota_exceeded_keeps_selection_blocked_until_persisted(monke
             status,
             deactivation_reason,
             reset_at,
+            blocked_at,
         )
 
     monkeypatch.setattr(accounts_repo, "update_status", blocking_update_status)
@@ -1241,10 +1314,12 @@ async def test_select_account_skips_stale_persistence_after_terminal_status_upda
         status: AccountStatus,
         deactivation_reason: str | None = None,
         reset_at: int | None = None,
+        blocked_at: int | None | object = _UNSET,
         *,
         expected_status: AccountStatus,
         expected_deactivation_reason: str | None = None,
         expected_reset_at: int | None = None,
+        expected_blocked_at: int | None | object = _UNSET,
     ) -> bool:
         persist_blocked.set()
         await release_persist.wait()
@@ -1253,9 +1328,11 @@ async def test_select_account_skips_stale_persistence_after_terminal_status_upda
             status,
             deactivation_reason,
             reset_at,
+            blocked_at,
             expected_status=expected_status,
             expected_deactivation_reason=expected_deactivation_reason,
             expected_reset_at=expected_reset_at,
+            expected_blocked_at=expected_blocked_at,
         )
 
     monkeypatch.setattr(accounts_repo, "update_status_if_current", blocking_update_status_if_current)

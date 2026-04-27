@@ -21,10 +21,10 @@ def test_responses_requires_input():
         ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi"})
 
 
-def test_store_true_is_rejected():
+def test_store_true_is_coerced_to_false():
     payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "store": True}
-    with pytest.raises(ValueError, match="store must be false"):
-        ResponsesRequest.model_validate(payload)
+    request = ResponsesRequest.model_validate(payload)
+    assert request.store is False
 
 
 def test_store_omitted_defaults_to_false():
@@ -42,10 +42,10 @@ def test_store_false_is_preserved():
     assert request.to_payload()["store"] is False
 
 
-def test_compact_store_true_is_rejected():
+def test_compact_store_true_is_coerced_to_false():
     payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "store": True}
-    with pytest.raises(ValueError, match="store must be false"):
-        ResponsesCompactRequest.model_validate(payload)
+    request = ResponsesCompactRequest.model_validate(payload)
+    assert request.store is False
 
 
 def test_compact_store_omitted_defaults_to_false():
@@ -108,6 +108,8 @@ def test_responses_normalizes_fast_service_tier_to_priority_for_upstream():
     request = ResponsesRequest.model_validate(payload)
 
     assert request.service_tier == "priority"
+    assert request.service_tier_input == "fast"
+    assert request.platform_forwarded_service_tier() == "default"
     dumped = request.to_payload()
     assert dumped["service_tier"] == "priority"
 
@@ -139,6 +141,8 @@ def test_compact_normalizes_fast_service_tier_to_priority_for_upstream():
     request = ResponsesCompactRequest.model_validate(payload)
 
     assert request.service_tier == "priority"
+    assert request.service_tier_input == "fast"
+    assert request.platform_forwarded_service_tier() == "default"
     dumped = request.to_payload()
     assert dumped["service_tier"] == "priority"
 
@@ -265,6 +269,8 @@ def test_v1_responses_normalizes_fast_service_tier_to_priority_for_upstream():
     request = V1ResponsesRequest.model_validate(payload).to_responses_request()
 
     assert request.service_tier == "priority"
+    assert request.service_tier_input == "fast"
+    assert request.platform_forwarded_service_tier() == "default"
     dumped = request.to_payload()
     assert dumped["service_tier"] == "priority"
 
@@ -368,6 +374,33 @@ def test_responses_accepts_builtin_tools(tool_type, expected):
     request = ResponsesRequest.model_validate(payload)
 
     assert request.tools == [{"type": expected}]
+
+
+@pytest.mark.parametrize(
+    "tool_payload",
+    [
+        {"type": "image_generation"},
+        {
+            "type": "computer_use_preview",
+            "display_width": 1024,
+            "display_height": 768,
+            "environment": "browser",
+        },
+        {"type": "computer_use", "display_width": 1024, "display_height": 768, "environment": "browser"},
+        {"type": "file_search", "vector_store_ids": ["vs_dummy"]},
+        {"type": "code_interpreter", "container": {"type": "auto"}},
+    ],
+)
+def test_responses_accepts_builtin_tool_passthrough(tool_payload):
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "tools": [tool_payload],
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.tools == [tool_payload]
 
 
 @pytest.mark.parametrize("tool_choice", [{"type": "web_search"}, {"type": "web_search_preview"}])
@@ -484,10 +517,59 @@ def test_v1_input_string_passthrough():
     assert request.input == [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
 
 
-def test_v1_allows_builtin_tools():
-    payload = {"model": "gpt-5.1", "input": [], "tools": [{"type": "image_generation"}]}
-    request = V1ResponsesRequest.model_validate(payload)
-    assert request.tools == [{"type": "image_generation"}]
+@pytest.mark.parametrize(
+    "tool_payload",
+    [
+        {"type": "image_generation"},
+        {
+            "type": "computer_use_preview",
+            "display_width": 1024,
+            "display_height": 768,
+            "environment": "browser",
+        },
+        {"type": "computer_use", "display_width": 1024, "display_height": 768, "environment": "browser"},
+        {"type": "file_search", "vector_store_ids": ["vs_dummy"]},
+        {"type": "code_interpreter", "container": {"type": "auto"}},
+    ],
+)
+def test_v1_responses_accepts_builtin_tools(tool_payload):
+    payload = {"model": "gpt-5.1", "input": [], "tools": [tool_payload]}
+    request = V1ResponsesRequest.model_validate(payload).to_responses_request()
+
+    assert request.tools == [tool_payload]
+
+
+def test_compact_strips_tool_fields():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "tools": [{"type": "image_generation"}],
+        "tool_choice": {"type": "image_generation"},
+        "parallel_tool_calls": True,
+    }
+    request = ResponsesCompactRequest.model_validate(payload)
+
+    dumped = request.to_payload()
+    assert "tools" not in dumped
+    assert "tool_choice" not in dumped
+    assert "parallel_tool_calls" not in dumped
+
+
+def test_v1_compact_strips_tool_fields():
+    payload = {
+        "model": "gpt-5.1",
+        "input": "hello",
+        "tools": [{"type": "image_generation"}],
+        "tool_choice": {"type": "image_generation"},
+        "parallel_tool_calls": True,
+    }
+    request = V1ResponsesCompactRequest.model_validate(payload).to_compact_request()
+
+    dumped = request.to_payload()
+    assert "tools" not in dumped
+    assert "tool_choice" not in dumped
+    assert "parallel_tool_calls" not in dumped
 
 
 def test_v1_compact_messages_convert():
@@ -529,11 +611,11 @@ def test_v1_compact_store_omitted_defaults_to_false():
     assert "store" not in request.to_payload()
 
 
-def test_v1_compact_store_true_is_rejected():
+def test_v1_compact_store_true_is_coerced_to_false():
     payload = {"model": "gpt-5.1", "input": "hello", "store": True}
-
-    with pytest.raises(ValidationError, match="store must be false"):
-        V1ResponsesCompactRequest.model_validate(payload).to_compact_request()
+    request = V1ResponsesCompactRequest.model_validate(payload)
+    compact = request.to_compact_request()
+    assert compact.store is False
 
 
 def test_responses_normalizes_assistant_input_text_to_output_text():

@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM oven/bun:1.3.7-alpine AS frontend-build
+FROM oven/bun:1.3.10-alpine AS frontend-build
 
 WORKDIR /app/frontend
 

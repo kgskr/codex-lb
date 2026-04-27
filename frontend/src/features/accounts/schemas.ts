@@ -1,4 +1,4 @@
-import { z } from "zod";
+import * as z from "zod";
 
 export const ProviderKindSchema = z.enum(["chatgpt_web", "openai_platform"]);
 export const PlatformRouteFamilySchema = z.enum([

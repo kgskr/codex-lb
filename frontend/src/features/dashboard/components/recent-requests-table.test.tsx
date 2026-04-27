@@ -59,6 +59,7 @@ describe("RecentRequestsTable", () => {
           {
             requestedAt: ISO,
             accountId: "acc-primary",
+            planType: "plus",
             apiKeyName: "Key Alpha",
             requestId: "req-1",
             providerKind: "openai_platform",
@@ -86,6 +87,7 @@ describe("RecentRequestsTable", () => {
 
     expect(screen.getByText("Primary Account")).toBeInTheDocument();
     expect(screen.getByText("OpenAI Platform | platform-subject-1")).toBeInTheDocument();
+    expect(screen.getAllByText("Plus")[0]).toBeInTheDocument();
     expect(screen.getByText("Key Alpha")).toBeInTheDocument();
     expect(screen.getByText("Upstream upstream-req-1")).toBeInTheDocument();
     expect(screen.getByText("gpt-5.1 (high, default)")).toBeInTheDocument();
@@ -147,6 +149,7 @@ describe("RecentRequestsTable", () => {
           {
             requestedAt: ISO,
             accountId: "acc-legacy",
+            planType: null,
             apiKeyName: null,
             requestId: "req-legacy",
             providerKind: null,
@@ -184,6 +187,7 @@ describe("RecentRequestsTable", () => {
           {
             requestedAt: ISO,
             accountId: "acc-legacy",
+            planType: null,
             apiKeyName: null,
             requestId: "req-error-code",
             providerKind: null,

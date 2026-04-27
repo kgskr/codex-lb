@@ -1,5 +1,5 @@
 import { HttpResponse, http } from "msw";
-import { z } from "zod";
+import * as z from "zod";
 
 import { LIMIT_TYPES, LIMIT_WINDOWS } from "@/features/api-keys/schemas";
 import {

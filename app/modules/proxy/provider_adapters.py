@@ -13,9 +13,15 @@ from app.core.clients.openai_platform import create_response as create_platform_
 from app.core.clients.openai_platform import fetch_models as fetch_platform_models
 from app.core.clients.openai_platform import stream_responses as stream_platform_responses
 from app.core.clients.proxy import compact_responses as _proxy_compact_responses
+from app.core.clients.proxy import fetch_codex_models as _proxy_fetch_codex_models
 from app.core.clients.proxy import stream_responses as _proxy_stream_responses
 from app.core.clients.proxy import transcribe_audio as _proxy_transcribe_audio
-from app.core.clients.proxy_websocket import UpstreamResponsesWebSocket, connect_responses_websocket
+from app.core.clients.proxy_websocket import (
+    UpstreamResponsesWebSocket,
+)
+from app.core.clients.proxy_websocket import (
+    connect_responses_websocket as _proxy_connect_responses_websocket,
+)
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.core.openai.models import CompactResponsePayload, OpenAIResponsePayload
@@ -45,6 +51,10 @@ type _CompactResponsesCallable = Callable[
 type _TranscribeAudioCallable = Callable[
     ...,
     Awaitable[dict[str, JsonValue]],
+]
+type _ConnectResponsesWebSocketCallable = Callable[
+    [Mapping[str, str], str, str | None],
+    Awaitable[UpstreamResponsesWebSocket],
 ]
 
 
@@ -97,9 +107,12 @@ async def core_transcribe_audio(
     )
 
 
+connect_responses_websocket = _proxy_connect_responses_websocket
+
 _DEFAULT_CORE_COMPACT_RESPONSES = core_compact_responses
 _DEFAULT_CORE_STREAM_RESPONSES = core_stream_responses
 _DEFAULT_CORE_TRANSCRIBE_AUDIO = core_transcribe_audio
+_DEFAULT_CONNECT_RESPONSES_WEBSOCKET = connect_responses_websocket
 
 
 def _resolve_proxy_compat_callable(name: str, default: object) -> object:
@@ -195,7 +208,13 @@ class ProviderAdapter(Protocol):
         capabilities: RequestCapabilities,
     ) -> ProviderCapabilityDecision: ...
 
-    async def fetch_models(self, subject: ProviderSubject) -> ProviderModelsResult: ...
+    async def fetch_models(
+        self,
+        subject: ProviderSubject,
+        *,
+        headers: Mapping[str, str] | None = None,
+        route_class: str | None = None,
+    ) -> ProviderModelsResult: ...
 
     async def create_response(
         self,
@@ -250,9 +269,17 @@ class ChatGPTWebProviderAdapter:
         del subject, capabilities
         return ProviderCapabilityDecision(allowed=True)
 
-    async def fetch_models(self, subject: ProviderSubject) -> ProviderModelsResult:
-        del subject
-        raise NotImplementedError("ChatGPT-web model discovery remains local-registry backed in phase 1")
+    async def fetch_models(
+        self,
+        subject: ProviderSubject,
+        *,
+        headers: Mapping[str, str] | None = None,
+        route_class: str | None = None,
+    ) -> ProviderModelsResult:
+        del route_class
+        access_token, account_id = self._upstream_auth(subject)
+        result = await _proxy_fetch_codex_models(headers or {}, access_token, account_id)
+        return ProviderModelsResult(payload=result.payload, upstream_request_id=result.upstream_request_id)
 
     async def create_response(
         self,
@@ -341,7 +368,14 @@ class ChatGPTWebProviderAdapter:
         headers: Mapping[str, str],
     ) -> UpstreamResponsesWebSocket:
         access_token, account_id = self._upstream_auth(subject)
-        return await connect_responses_websocket(dict(headers), access_token, account_id)
+        connect_impl = cast(
+            _ConnectResponsesWebSocketCallable,
+            _resolve_proxy_compat_callable(
+                "connect_responses_websocket",
+                _DEFAULT_CONNECT_RESPONSES_WEBSOCKET,
+            ),
+        )
+        return await connect_impl(dict(headers), access_token, account_id)
 
     async def refresh_usage(
         self,
@@ -482,8 +516,10 @@ class OpenAIPlatformProviderAdapter:
         self,
         subject: ProviderSubject,
         *,
+        headers: Mapping[str, str] | None = None,
         route_class: str = OPENAI_PUBLIC_HTTP_ROUTE_CLASS,
     ) -> ProviderModelsResult:
+        del headers
         started_at = self._maybe_log_request_start(
             kind="platform_models",
             method="GET",
@@ -590,9 +626,13 @@ class OpenAIPlatformProviderAdapter:
             route_class=route_class,
         )
         try:
+            payload_dict: dict[str, JsonValue] = dict(payload.to_payload().items())
+            forwarded_service_tier = payload.platform_forwarded_service_tier()
+            if forwarded_service_tier is not None:
+                payload_dict["service_tier"] = forwarded_service_tier
             result = await create_platform_compact_response(
                 base_url=self._base_url,
-                payload=payload.to_payload(),
+                payload=payload_dict,
                 api_key=self._encryptor.decrypt(subject.require_api_key_encrypted()),
                 organization=subject.organization_id,
                 project=subject.project_id,

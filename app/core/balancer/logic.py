@@ -14,6 +14,7 @@ PERMANENT_FAILURE_CODES = {
     "refresh_token_expired": "Refresh token expired - re-login required",
     "refresh_token_reused": "Refresh token was reused - re-login required",
     "refresh_token_invalidated": "Refresh token was revoked - re-login required",
+    "account_deactivated": "Account has been deactivated",
     "account_suspended": "Account has been suspended",
     "account_deleted": "Account has been deleted",
 }
@@ -50,6 +51,7 @@ class AccountState:
     status: AccountStatus
     used_percent: float | None = None
     reset_at: float | None = None
+    blocked_at: float | None = None
     cooldown_until: float | None = None
     secondary_used_percent: float | None = None
     secondary_reset_at: int | None = None
@@ -281,6 +283,7 @@ def handle_rate_limit(state: AccountState, error: UpstreamError) -> None:
     state.status = AccountStatus.RATE_LIMITED
     state.error_count += 1
     state.last_error_at = time.time()
+    state.blocked_at = time.time()
 
     reset_at = _extract_reset_at(error)
     if reset_at is not None:
@@ -299,6 +302,7 @@ QUOTA_EXCEEDED_COOLDOWN_SECONDS = 120.0
 def handle_quota_exceeded(state: AccountState, error: UpstreamError) -> None:
     state.status = AccountStatus.QUOTA_EXCEEDED
     state.used_percent = 100.0
+    state.blocked_at = time.time()
     state.cooldown_until = time.time() + QUOTA_EXCEEDED_COOLDOWN_SECONDS
 
     reset_at = _extract_reset_at(error)
@@ -314,6 +318,7 @@ def handle_permanent_failure(state: AccountState, error_code: str) -> None:
         error_code,
         f"Authentication failed: {error_code}",
     )
+    state.blocked_at = None
 
 
 FailoverAction = Literal["failover_next", "surface"]

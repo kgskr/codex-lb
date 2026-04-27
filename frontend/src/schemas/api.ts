@@ -1,4 +1,4 @@
-import { z } from "zod";
+import * as z from "zod";
 
 export const DashboardApiErrorDetailSchema = z.object({
   code: z.string(),

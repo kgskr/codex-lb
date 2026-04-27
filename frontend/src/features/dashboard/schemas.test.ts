@@ -134,6 +134,7 @@ describe("RequestLogsResponseSchema", () => {
         {
           requestedAt: ISO,
           accountId: "acc-1",
+          planType: "plus",
           apiKeyName: "Key A",
           requestId: "req-1",
           providerKind: "openai_platform",
@@ -161,6 +162,7 @@ describe("RequestLogsResponseSchema", () => {
     expect(parsed.requests[0]?.providerKind).toBe("openai_platform");
     expect(parsed.requests[0]?.routingSubjectId).toBe("platform-1");
     expect(parsed.requests[0]?.upstreamRequestId).toBe("upstream-req-1");
+    expect(parsed.requests[0]?.planType).toBe("plus");
     expect(parsed.requests[0]?.transport).toBe("websocket");
   });
 });

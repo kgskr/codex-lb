@@ -12,6 +12,7 @@ class RequestLogEntry(DashboardModel):
     account_id: str | None = None
     provider_kind: str | None = None
     routing_subject_id: str | None = None
+    plan_type: str | None = None
     api_key_name: str | None = None
     request_id: str
     model: str

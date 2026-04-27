@@ -1,4 +1,4 @@
-import { z } from "zod";
+import * as z from "zod";
 
 export const ApiKeyTrendPointSchema = z.object({
   t: z.string().datetime({ offset: true }),

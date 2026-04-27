@@ -4,16 +4,20 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   changePassword,
+  loginPassword,
   removePassword,
   setupPassword,
+  verifyTotp,
 } from "@/features/auth/api";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
 import { PasswordSettings } from "@/features/settings/components/password-settings";
 
 vi.mock("@/features/auth/api", () => ({
   setupPassword: vi.fn(),
+  loginPassword: vi.fn(),
   changePassword: vi.fn(),
   removePassword: vi.fn(),
+  verifyTotp: vi.fn(),
 }));
 
 describe("PasswordSettings", () => {
@@ -23,6 +27,8 @@ describe("PasswordSettings", () => {
       passwordRequired: false,
       bootstrapRequired: false,
       bootstrapTokenConfigured: false,
+      authMode: "standard",
+      passwordManagementEnabled: true,
       refreshSession: vi.fn().mockResolvedValue(undefined),
     });
   });
@@ -34,7 +40,7 @@ describe("PasswordSettings", () => {
   });
 
   it("shows change/remove buttons when password is configured", () => {
-    useAuthStore.setState({ passwordRequired: true });
+    useAuthStore.setState({ passwordRequired: true, passwordSessionActive: true });
     render(<PasswordSettings />);
     expect(screen.getByRole("button", { name: "Change" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Remove" })).toBeInTheDocument();
@@ -76,7 +82,7 @@ describe("PasswordSettings", () => {
 
   it("handles change flow via dialog", async () => {
     const user = userEvent.setup();
-    useAuthStore.setState({ passwordRequired: true });
+    useAuthStore.setState({ passwordRequired: true, passwordSessionActive: true });
     vi.mocked(changePassword).mockResolvedValue({} as never);
 
     render(<PasswordSettings />);
@@ -95,7 +101,7 @@ describe("PasswordSettings", () => {
 
   it("handles remove flow via dialog", async () => {
     const user = userEvent.setup();
-    useAuthStore.setState({ passwordRequired: true });
+    useAuthStore.setState({ passwordRequired: true, passwordSessionActive: true });
     vi.mocked(removePassword).mockResolvedValue({} as never);
 
     render(<PasswordSettings />);
@@ -119,5 +125,70 @@ describe("PasswordSettings", () => {
     await user.click(screen.getAllByRole("button", { name: "Set password" }).find((btn) => btn.getAttribute("type") === "submit")!);
 
     expect(await screen.findByText("setup failed")).toBeInTheDocument();
+  });
+
+  it("describes password as fallback in trusted header mode", () => {
+    useAuthStore.setState({ authMode: "trusted_header", passwordRequired: false });
+
+    render(<PasswordSettings />);
+
+    expect(screen.getByText("No fallback password set.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Set password" })).toBeInTheDocument();
+  });
+
+  it("hides change/remove when proxy-authenticated without password session", () => {
+    useAuthStore.setState({
+      authMode: "trusted_header",
+      passwordRequired: true,
+      authenticated: true,
+      passwordManagementEnabled: true,
+      passwordSessionActive: false,
+    });
+    render(<PasswordSettings />);
+
+    expect(screen.getByText("Password is configured as an optional fallback.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Login to manage" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Change" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Set password" })).not.toBeInTheDocument();
+  });
+
+  it("re-establishes password session from proxy-authenticated manage flow", async () => {
+    const user = userEvent.setup();
+    const refreshSession = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(loginPassword).mockResolvedValue({
+      totpRequiredOnLogin: false,
+      passwordSessionActive: true,
+    } as never);
+    useAuthStore.setState({
+      authMode: "trusted_header",
+      passwordRequired: true,
+      authenticated: true,
+      passwordManagementEnabled: true,
+      passwordSessionActive: false,
+      refreshSession,
+    });
+
+    render(<PasswordSettings />);
+
+    await user.click(screen.getByRole("button", { name: "Login to manage" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Password"), "fallback-password");
+    await user.click(screen.getByRole("button", { name: "Verify" }));
+
+    expect(loginPassword).toHaveBeenCalledWith({ password: "fallback-password" });
+    expect(refreshSession).toHaveBeenCalled();
+    expect(verifyTotp).not.toHaveBeenCalled();
+  });
+
+  it("hides password actions when password management is disabled", () => {
+    useAuthStore.setState({ authMode: "disabled", passwordManagementEnabled: false });
+
+    render(<PasswordSettings />);
+
+    expect(screen.getByText("Password login is disabled by the current dashboard auth mode.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Set password" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Change" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
   });
 });
